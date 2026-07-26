@@ -1,0 +1,10 @@
+{
+  "示例播客": {
+    "artist_name": "示例作者",
+    "collection_name": "示例播客",
+    "feed_url": "https://example.com/podcast/feed.xml",
+    "resolved_at": "2026-01-01T00:00:00+00:00",
+    "source": "manual",
+    "track_count": 0
+  }
+}

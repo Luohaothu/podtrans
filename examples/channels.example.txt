@@ -1,0 +1,2 @@
+# One podcast name per line. The name becomes the local channel directory.
+示例播客

@@ -1,0 +1,33 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data and downloaded models
+/data/
+/_metadata/
+/channels.txt
+/feeds.json
+/.cache/
+/models/
+
+# Podcast media and generated transcripts
+*.aac
+*.flac
+*.m4a
+*.mp3
+*.mp4
+*.ogg
+*.wav
+*.part
+transcript*.json
+transcript*.md
+transcript*.txt
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
