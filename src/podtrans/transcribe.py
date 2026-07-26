@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -17,13 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import archive_xiaoyuzhou_channels as archive
+from . import archive
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-ROOT = Path(
-    os.environ.get("PODTRANS_DATA_DIR", PROJECT_ROOT / "data")
-).expanduser().resolve()
+ROOT = archive.ROOT
 DEFAULT_MODEL = "FunAudioLLM/Fun-ASR-Nano-2512"
 REPORT_FILE = ROOT / "_metadata" / "transcription_report.json"
 MANIFEST_FILE = ROOT / "_metadata" / "transcription_manifest.jsonl"
@@ -526,7 +522,10 @@ def verify_only() -> int:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="podtrans transcribe",
+        description=__doc__,
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--backend", choices=["auto", "vllm"], default="auto")
     parser.add_argument("--device", default="cuda")

@@ -11,17 +11,13 @@ import re
 import shutil
 import struct
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-import archive_xiaoyuzhou_channels as archive
+from .. import archive
 
 
 ROOT = archive.ROOT
@@ -618,7 +614,10 @@ def write_markdown_report(report: dict[str, Any], path: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="podtrans validate-archive",
+        description=__doc__,
+    )
     parser.add_argument("--workers", type=int, default=8, help="parallel audio header parsers")
     parser.add_argument("--json", type=Path, default=REPORT_JSON, help="JSON report path")
     parser.add_argument("--markdown", type=Path, default=REPORT_MD, help="Markdown report path")

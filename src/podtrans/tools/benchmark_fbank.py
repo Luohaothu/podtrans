@@ -13,12 +13,15 @@ import torch
 from funasr.models.campplus.utils import extract_feature
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="podtrans benchmark-fbank",
+        description=__doc__,
+    )
     parser.add_argument("--cpu-threads", type=int, required=True)
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--windows", type=int, default=1536)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     torch.set_num_threads(args.cpu_threads)
     torch.set_num_interop_threads(max(1, min(args.concurrency, 4)))

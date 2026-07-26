@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Archive Xiaoyuzhou podcast channels from RSS feeds.
 
-The script is deliberately dependency-free so it can be resumed on a bare
+The command is deliberately dependency-free so it can be resumed on a bare
 Python install. It keeps RSS metadata as the source of truth, numbers episodes
 oldest-to-newest, and downloads each audio enclosure into:
 
@@ -32,9 +32,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 ROOT = Path(
-    os.environ.get("PODTRANS_DATA_DIR", PROJECT_ROOT / "data")
+    os.environ.get("PODTRANS_DATA_DIR", Path.cwd() / "data")
 ).expanduser().resolve()
 CHANNELS_FILE = ROOT / "channels.txt"
 FEEDS_FILE = ROOT / "feeds.json"
@@ -922,7 +921,7 @@ def load_problem_numbers(path: Path = REPORT_FILE) -> dict[str, set[str]]:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(prog="podtrans archive", description=__doc__)
     parser.add_argument("--resolve", action="store_true", help="discover missing feed URLs via iTunes search")
     parser.add_argument("--metadata-only", action="store_true", help="fetch RSS and write metadata without audio")
     parser.add_argument("--download", action="store_true", help="download audio files")

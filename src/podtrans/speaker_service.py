@@ -9,7 +9,6 @@ import os
 import queue
 import signal
 import socket
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from diarize_funasr import (
+from .diarize import (
     DEFAULT_SPEAKER_MODEL,
     ROOT,
     SPEAKER_SERVICE_AUTHKEY,
@@ -84,10 +83,6 @@ class SpeakerEmbeddingServer:
         torch.set_num_interop_threads(max(1, min(args.handler_workers, 4)))
 
         model_path = args.speaker_model_path or cached_model_path(args.speaker_model)
-        if model_path is None:
-            raise RuntimeError(
-                "speaker model is not cached; download it from ModelScope first"
-            )
         kwargs = auto_model_kwargs(
             args.speaker_model,
             model_path=model_path,
@@ -144,7 +139,9 @@ class SpeakerEmbeddingServer:
             "pid": os.getpid(),
             "socket": str(self.args.socket),
             "speaker_model": self.args.speaker_model,
-            "speaker_model_path": str(self.model_path),
+            "speaker_model_path": (
+                str(self.model_path) if self.model_path is not None else None
+            ),
             "speaker_model_precision": "fp32",
             "allow_tf32": False,
             "device": self.args.device,
@@ -466,8 +463,11 @@ class SpeakerEmbeddingServer:
             self.write_status("stopped")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="podtrans speaker-service",
+        description=__doc__,
+    )
     parser.add_argument("--speaker-model", default=DEFAULT_SPEAKER_MODEL)
     parser.add_argument("--speaker-model-path", type=Path)
     parser.add_argument("--hub", choices=["ms", "hf"], default="ms")
@@ -484,7 +484,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.max_batch_size <= 0:
         parser.error("--max-batch-size must be positive")
     if (
@@ -505,8 +505,8 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     if args.check:
         response = request(
             args.socket,

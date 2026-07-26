@@ -8,15 +8,27 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
+          enable-cache: true
           python-version: "3.12"
-      - name: Install lightweight test dependency
-        run: python -m pip install "numpy>=2,<3"
+      - name: Sync locked development environment
+        run: uv sync --locked
       - name: Compile Python sources
-        run: python -m compileall -q .
+        run: uv run --frozen python -m compileall -q src tests
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
-      - name: Check shell syntax
-        run: bash -n scripts/*.sh
+        run: uv run --frozen python -m unittest discover -s tests -v
+      - name: Smoke test installed CLI
+        run: uv run --frozen podtrans --version
+      - name: Build wheel and source distribution
+        run: uv build
+      - name: Verify wheel installation and console entry point
+        run: |
+          uv venv /tmp/podtrans-wheel-test
+          uv pip install \
+            --python /tmp/podtrans-wheel-test/bin/python \
+            --no-deps \
+            dist/podtrans-0.2.0-py3-none-any.whl
+          /tmp/podtrans-wheel-test/bin/podtrans profiles --cpu-cores 8

@@ -1,0 +1,60 @@
+[project]
+name = "podtrans"
+version = "0.2.0"
+description = "Podcast archiving, FunASR transcription, and speaker diarization"
+readme = "README.md"
+authors = [
+    { name = "Luohao Wang", email = "luohaothu@live.com" }
+]
+requires-python = ">=3.11,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["podcast", "funasr", "transcription", "speaker-diarization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = []
+
+[project.optional-dependencies]
+inference = [
+    "funasr>=1.3.14,<2",
+    "imageio-ffmpeg>=0.6,<1",
+    "modelscope>=1.28,<2",
+    "numpy>=2,<3",
+    "torch>=2.6,<3",
+    "torchaudio>=2.6,<3",
+]
+vllm = [
+    "funasr>=1.3.14,<2",
+    "imageio-ffmpeg>=0.6,<1",
+    "modelscope>=1.28,<2",
+    "numpy>=2,<3",
+    "torch>=2.6,<3",
+    "torchaudio>=2.6,<3",
+    "vllm>=0.15,<1; platform_system == 'Linux'",
+]
+
+[project.scripts]
+podtrans = "podtrans.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Luohaothu/podtrans"
+Repository = "https://github.com/Luohaothu/podtrans"
+Issues = "https://github.com/Luohaothu/podtrans/issues"
+
+[dependency-groups]
+dev = [
+    "numpy>=2,<3",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+required-version = ">=0.11.0"

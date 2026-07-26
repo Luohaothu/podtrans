@@ -1,13 +1,7 @@
-import sys
 import unittest
-from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from diarize_funasr import SPEAKER_SERVICE_AUTHKEY
-from speaker_embedding_service import AUTHKEY, DEFAULT_SOCKET
+from podtrans.diarize import SPEAKER_SERVICE_AUTHKEY
+from podtrans.speaker_service import AUTHKEY, DEFAULT_SOCKET
 
 
 class SpeakerServiceContractTests(unittest.TestCase):

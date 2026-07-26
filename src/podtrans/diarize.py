@@ -23,13 +23,10 @@ from typing import Any, Iterable
 
 import numpy as np
 
-import archive_xiaoyuzhou_channels as archive
+from . import archive
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-ROOT = Path(
-    os.environ.get("PODTRANS_DATA_DIR", PROJECT_ROOT / "data")
-).expanduser().resolve()
+ROOT = archive.ROOT
 DEFAULT_SPEAKER_MODEL = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
 DEFAULT_VAD_MODEL = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 DEFAULT_OUTPUT_PREFIX = "transcript_speakers"
@@ -1540,7 +1537,7 @@ def process_job_result(
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(prog="podtrans diarize", description=__doc__)
     parser.add_argument("--speaker-model", default=DEFAULT_SPEAKER_MODEL)
     parser.add_argument("--speaker-model-path", type=Path)
     parser.add_argument("--vad-model", default=DEFAULT_VAD_MODEL)

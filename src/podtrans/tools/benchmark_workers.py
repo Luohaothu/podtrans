@@ -13,11 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from diarize_funasr import (
+from ..diarize import (
     DEFAULT_OUTPUT_PREFIX,
     ROOT,
     load_jobs,
@@ -137,8 +133,11 @@ def output_core(episode_dir: Path, prefix: str) -> dict[str, object]:
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="podtrans benchmark-workers",
+        description=__doc__,
+    )
     parser.add_argument("--channel", required=True)
     parser.add_argument("--episodes", type=int, default=32)
     parser.add_argument(
@@ -152,7 +151,7 @@ def main() -> int:
     parser.add_argument("--cpu-threads", type=int, default=8)
     parser.add_argument("--speaker-service-socket", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.episodes <= 0:
         parser.error("--episodes must be positive")
 
@@ -198,7 +197,9 @@ def main() -> int:
                 handles.append(handle)
                 command = [
                     sys.executable,
-                    str(PROJECT_ROOT / "diarize_funasr.py"),
+                    "-m",
+                    "podtrans",
+                    "diarize",
                     "--device",
                     "cuda:0",
                     "--sort",

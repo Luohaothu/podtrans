@@ -5,17 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from diarize_funasr import (
+from ..diarize import (
     DEFAULT_SPEAKER_MODEL,
     ROOT,
     auto_model_kwargs,
@@ -118,8 +113,11 @@ def parse_thresholds(value: str) -> list[float]:
     return thresholds
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="podtrans validate-diarization",
+        description=__doc__,
+    )
     parser.add_argument("--speaker-model", default=DEFAULT_SPEAKER_MODEL)
     parser.add_argument("--speaker-model-path", type=Path)
     parser.add_argument("--hub", choices=["ms", "hf"], default="ms")
@@ -133,7 +131,7 @@ def main() -> int:
     )
     parser.add_argument("--windows-per-speaker", type=int, default=32)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     import torch
     from funasr import AutoModel
