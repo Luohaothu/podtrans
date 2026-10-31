@@ -1,4 +1,4 @@
-"""Run concurrent diarization with one shared speaker model service."""
+"""Run diarization with a shared speaker service, or in-process for CPU and Apple profiles."""
 
 from __future__ import annotations
 

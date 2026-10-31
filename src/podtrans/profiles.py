@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform as py_platform
 import re
 import subprocess
 import sys
@@ -18,7 +19,8 @@ SPEAKER_ERES2NET_V2 = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
 VAD_FSMN = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 VLLM_DTYPE = "bfloat16"
 
-# Printer bound. Selection accepts any positive M-series generation.
+# profiles --json / text list generations 1..N. get_profile and select_machine
+# still materialize later M-series generations from the same ladders.
 LISTED_APPLE_GENERATION_MAX = 5
 
 _APPLE_NAME = re.compile(r"^apple-m(\d+)-(\d+)gb$")
@@ -47,7 +49,7 @@ class Vram:
 
 @dataclass(frozen=True)
 class AppleChip:
-    """One Apple Silicon chip. The Pro, Max, or Ultra variant is not a selection key."""
+    """Detected Apple Silicon. Selection uses generation and unified_gb only."""
 
     generation: int
     unified_gb: float
@@ -95,8 +97,6 @@ class FunasrAuto:
 
 @dataclass(frozen=True)
 class FunasrVllm:
-    """vLLM engine. The device is CUDA because vLLM does not run on MPS or CPU."""
-
     model: str
     memory_utilization: float
     dtype: str = VLLM_DTYPE
@@ -131,7 +131,7 @@ class InProcessSpeaker:
 
 @dataclass(frozen=True)
 class SpeakerService:
-    """Shared CUDA speaker service. diarize-batch is what starts it."""
+    """Shared CUDA speaker embedding server."""
 
     model: str
     batch_size: int
@@ -159,7 +159,7 @@ class VramKey:
 
 @dataclass(frozen=True)
 class UnifiedKey:
-    """The rung that was selected, not the machine's raw unified size."""
+    """Apple profile match. memory_gb is the catalog floor, not raw unified size."""
 
     generation: int
     memory_gb: int
@@ -239,11 +239,10 @@ class HardwareProfile:
 
 @dataclass(frozen=True)
 class AppleRung:
-    """One memory floor inside a capability class. Generation is applied at materialize time."""
+    """One unified-memory floor. _materialize_apple stamps the generation onto the name."""
 
     memory_gb: int
     asr: FunasrAuto
-    speaker_device: Literal["cpu", "mps"]
     asr_batch_size: int
     asr_job_batch_size: int
     asr_decode_workers: int
@@ -257,13 +256,10 @@ def _nano(device: Literal["cpu", "cuda", "mps"]) -> FunasrAuto:
     return FunasrAuto(ASR_NANO, device)
 
 
-# generation <= 2 reads EARLY_RUNGS. generation >= 3 reads MODERN_RUNGS.
-# M5 and later stay on the modern ladder until a measured pair diverges.
 EARLY_RUNGS: tuple[AppleRung, ...] = (
     AppleRung(
         memory_gb=8,
         asr=_nano("cpu"),
-        speaker_device="cpu",
         asr_batch_size=1,
         asr_job_batch_size=1,
         asr_decode_workers=1,
@@ -279,7 +275,6 @@ EARLY_RUNGS: tuple[AppleRung, ...] = (
     AppleRung(
         memory_gb=16,
         asr=_nano("cpu"),
-        speaker_device="cpu",
         asr_batch_size=1,
         asr_job_batch_size=1,
         asr_decode_workers=2,
@@ -294,7 +289,6 @@ EARLY_RUNGS: tuple[AppleRung, ...] = (
     AppleRung(
         memory_gb=32,
         asr=_nano("mps"),
-        speaker_device="cpu",
         asr_batch_size=1,
         asr_job_batch_size=1,
         asr_decode_workers=2,
@@ -309,7 +303,6 @@ EARLY_RUNGS: tuple[AppleRung, ...] = (
     AppleRung(
         memory_gb=64,
         asr=_nano("mps"),
-        speaker_device="cpu",
         asr_batch_size=2,
         asr_job_batch_size=1,
         asr_decode_workers=2,
@@ -327,7 +320,6 @@ MODERN_RUNGS: tuple[AppleRung, ...] = (
     AppleRung(
         memory_gb=8,
         asr=_nano("cpu"),
-        speaker_device="cpu",
         asr_batch_size=1,
         asr_job_batch_size=1,
         asr_decode_workers=2,
@@ -342,7 +334,6 @@ MODERN_RUNGS: tuple[AppleRung, ...] = (
     AppleRung(
         memory_gb=16,
         asr=_nano("mps"),
-        speaker_device="cpu",
         asr_batch_size=1,
         asr_job_batch_size=1,
         asr_decode_workers=2,
@@ -357,7 +348,6 @@ MODERN_RUNGS: tuple[AppleRung, ...] = (
     AppleRung(
         memory_gb=32,
         asr=_nano("mps"),
-        speaker_device="cpu",
         asr_batch_size=2,
         asr_job_batch_size=2,
         asr_decode_workers=4,
@@ -369,7 +359,6 @@ MODERN_RUNGS: tuple[AppleRung, ...] = (
     AppleRung(
         memory_gb=64,
         asr=_nano("mps"),
-        speaker_device="cpu",
         asr_batch_size=4,
         asr_job_batch_size=2,
         asr_decode_workers=4,
@@ -398,7 +387,7 @@ def _materialize_apple(generation: int, rung: AppleRung) -> HardwareProfile:
         asr=rung.asr,
         speaker=InProcessSpeaker(
             model=SPEAKER_ERES2NET_V2,
-            device=rung.speaker_device,
+            device="cpu",
             vad_model=VAD_FSMN,
             vad_device="cpu",
             batch_size=rung.speaker_batch_size,
@@ -762,7 +751,7 @@ def select_machine(machine: Machine) -> HardwareProfile:
 
 
 def select_profile(vram_gb: float | None) -> HardwareProfile:
-    """VRAM floor kept for callers that only know a discrete-memory number."""
+    """Map discrete NVIDIA VRAM GB to a profile. Prefer select_machine for new code."""
     if vram_gb is None or vram_gb < 4:
         return select_machine(Machine(Family.CPU, "CPU"))
     return select_machine(Machine(Family.NVIDIA, "GPU", vram=Vram(vram_gb)))
@@ -967,9 +956,13 @@ def detect_nvidia_gpu(runner: ProbeRunner | None = None) -> tuple[str, float] | 
 def _detect_apple(
     *,
     platform: str | None = None,
+    machine: str | None = None,
     runner: ProbeRunner | None = None,
 ) -> AppleChip | None:
     if (sys.platform if platform is None else platform) != "darwin":
+        return None
+    arch = machine if machine is not None else py_platform.machine()
+    if arch not in {"arm64", "aarch64"}:
         return None
     try:
         result = _run_probe(
@@ -1000,6 +993,7 @@ def _detect_apple(
 def detect_machine(
     *,
     platform: str | None = None,
+    machine: str | None = None,
     nvidia_runner: ProbeRunner | None = None,
     apple_runner: ProbeRunner | None = None,
 ) -> Machine:
@@ -1007,7 +1001,7 @@ def detect_machine(
     if detected is not None:
         name, gb = detected
         return Machine(Family.NVIDIA, name, vram=Vram(gb))
-    chip = _detect_apple(platform=platform, runner=apple_runner)
+    chip = _detect_apple(platform=platform, machine=machine, runner=apple_runner)
     if chip is not None:
         return Machine(Family.APPLE, chip.brand, apple=chip)
     return Machine(Family.CPU, "CPU")

@@ -252,6 +252,7 @@ class MachineProbeTests(unittest.TestCase):
 
         machine = detect_machine(
             platform="darwin",
+            machine="arm64",
             nvidia_runner=self._missing,
             apple_runner=sysctl,
         )
@@ -264,12 +265,26 @@ class MachineProbeTests(unittest.TestCase):
         self.assertEqual(machine.label, "Apple M4 Pro")
         self.assertEqual(select_machine(machine).name, "apple-m4-16gb")
 
+    def test_rosetta_process_stays_on_cpu(self) -> None:
+        def sysctl(_command: list[str]) -> SimpleNamespace:
+            raise AssertionError("sysctl should not run under Rosetta")
+
+        machine = detect_machine(
+            platform="darwin",
+            machine="x86_64",
+            nvidia_runner=self._missing,
+            apple_runner=sysctl,
+        )
+        self.assertEqual(machine.family, Family.CPU)
+        self.assertEqual(select_machine(machine).name, "cpu")
+
     def test_non_apple_brand_stays_on_cpu(self) -> None:
         def sysctl(_command: list[str]) -> SimpleNamespace:
             return SimpleNamespace(stdout="Intel(R) Core(TM) i7\n17179869184\n")
 
         machine = detect_machine(
             platform="darwin",
+            machine="arm64",
             nvidia_runner=self._missing,
             apple_runner=sysctl,
         )
@@ -284,6 +299,7 @@ class MachineProbeTests(unittest.TestCase):
 
         machine = detect_machine(
             platform="darwin",
+            machine="arm64",
             nvidia_runner=nvidia,
             apple_runner=apple,
         )
