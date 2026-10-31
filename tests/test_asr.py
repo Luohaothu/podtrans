@@ -12,6 +12,10 @@ from urllib.error import HTTPError, URLError
 
 from podtrans.asr import (
     DEFAULT_MODEL,
+    IN_PROCESS_ASR_FLAGS,
+    REMOTE_ASR_FLAGS,
+    SHARED_ASR_FLAGS,
+    AsrSource,
     AutoModelAsr,
     RemoteAsr,
     VllmAsr,
@@ -19,6 +23,7 @@ from podtrans.asr import (
     open_asr,
     parse_asr_spec,
 )
+from podtrans.transcribe import ROOT, ChunkTask, Job, build_parser, transcribe_chunks, write_transcript
 
 
 URL = "http://127.0.0.1:8000/v1"
@@ -590,6 +595,125 @@ class LocalSessionTests(unittest.TestCase):
         self.assertEqual(constructed[0]["dtype"], "bfloat16")
         self.assertEqual(constructed[0]["tensor_parallel_size"], 1)
         self.assertIs(constructed[0]["enforce_eager"], False)
+
+
+class TranscribeBoundaryTests(unittest.TestCase):
+    def test_parser_flags_belong_to_one_class_and_in_process_defaults_are_unset(self) -> None:
+        parser = build_parser()
+        options: set[str] = set()
+        for action in parser._actions:
+            for option in action.option_strings:
+                if option.startswith("--") and option != "--help":
+                    options.add(option)
+            if set(action.option_strings) & IN_PROCESS_ASR_FLAGS or "--model" in action.option_strings:
+                self.assertIsNone(action.default, action.option_strings)
+        self.assertEqual(options, SHARED_ASR_FLAGS | IN_PROCESS_ASR_FLAGS | REMOTE_ASR_FLAGS)
+
+        unset = parser.parse_args([])
+        self.assertIsNone(unset.backend)
+        self.assertIsNone(unset.device)
+        self.assertIsNone(unset.vllm_enforce_eager)
+        spec = parse_asr_spec(unset)
+        assert isinstance(spec, AutoModelAsr)
+        self.assertEqual(spec.model, DEFAULT_MODEL)
+        self.assertEqual(spec.device, "cuda")
+        self.assertEqual(spec.max_length, 256)
+
+        eager = parser.parse_args(["--vllm-enforce-eager", "--backend", "vllm"])
+        self.assertIs(eager.vllm_enforce_eager, True)
+        vllm_spec = parse_asr_spec(eager)
+        assert isinstance(vllm_spec, VllmAsr)
+        self.assertIs(vllm_spec.options.enforce_eager, True)
+
+        remote_conflict = parser.parse_args(
+            ["--asr-url", URL, "--model", "whisper", "--device", "cuda"]
+        )
+        with self.assertRaisesRegex(ValueError, "--device"):
+            parse_asr_spec(remote_conflict)
+
+    def test_group_failure_retries_each_wav_without_shrinking_later_groups(self) -> None:
+        calls: list[list[str]] = []
+
+        class Session:
+            source = AsrSource(model="m", backend="openai", device="remote", endpoint=URL)
+            batch_size = 2
+
+            def transcribe(self, paths: list[str]) -> list[dict[str, object]]:
+                calls.append(list(paths))
+                if paths == ["a.wav", "b.wav"]:
+                    raise RuntimeError("group failed")
+                if paths == ["b.wav"]:
+                    raise RuntimeError("bad chunk")
+                return [{"text": path, "timestamps": []} for path in paths]
+
+        job = Job(
+            channel="c",
+            number="1",
+            title="t",
+            episode_dir=Path("."),
+            audio_path=Path("audio"),
+            transcript_json=Path("transcript.json"),
+            transcript_txt=Path("transcript.txt"),
+            transcript_md=Path("transcript.md"),
+        )
+        tasks = [
+            ChunkTask(job, 0, "a.wav"),
+            ChunkTask(job, 1, "b.wav"),
+            ChunkTask(job, 2, "c.wav"),
+            ChunkTask(job, 3, "d.wav"),
+        ]
+        results, errors = transcribe_chunks(Session(), tasks)
+        self.assertEqual(calls, [["a.wav", "b.wav"], ["a.wav"], ["b.wav"], ["c.wav", "d.wav"]])
+        self.assertEqual(results[tasks[0]]["text"], "a.wav")
+        self.assertNotIn(tasks[1], results)
+        self.assertEqual(results[tasks[2]]["text"], "c.wav")
+        self.assertEqual(results[tasks[3]]["text"], "d.wav")
+        self.assertIn("bad chunk", repr(errors[job]))
+
+    def test_transcript_records_the_endpoint_host_and_not_a_key(self) -> None:
+        episode_dir = ROOT / "_metadata" / "asr-url-test"
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        audio = episode_dir / "audio.wav"
+        audio.write_bytes(b"wav")
+        job = Job(
+            channel="c",
+            number="1",
+            title="t",
+            episode_dir=episode_dir,
+            audio_path=audio,
+            transcript_json=episode_dir / "transcript.json",
+            transcript_txt=episode_dir / "transcript.txt",
+            transcript_md=episode_dir / "transcript.md",
+        )
+        result = {
+            "text": "hi",
+            "chunks": [{"index": 0, "text": "hi", "result": {"text": "hi", "timestamps": []}}],
+        }
+        remote = AsrSource(
+            model="whisper",
+            backend="openai",
+            device="remote",
+            endpoint=URL,
+        )
+        try:
+            write_transcript(job, result, {"chunk_count": 1}, remote)
+            payload = json.loads(job.transcript_json.read_text(encoding="utf-8"))
+            self.assertEqual(payload["meta"]["asr_url"], URL)
+            self.assertEqual(payload["backend"], "openai")
+            self.assertEqual(payload["device"], "remote")
+            self.assertEqual(payload["model"], "whisper")
+            rendered = json.dumps(payload)
+            self.assertNotIn("sk-", rendered)
+            self.assertNotIn("asr_url", json.dumps(payload["result"]))
+            local = AsrSource(model=DEFAULT_MODEL, backend="auto_model", device="cuda")
+            write_transcript(job, result, {"chunk_count": 1}, local)
+            local_payload = json.loads(job.transcript_json.read_text(encoding="utf-8"))
+            self.assertNotIn("asr_url", local_payload["meta"])
+            self.assertEqual(local_payload["backend"], "auto_model")
+        finally:
+            for path in episode_dir.iterdir():
+                path.unlink()
+            episode_dir.rmdir()
 
 
 if __name__ == "__main__":
