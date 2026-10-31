@@ -124,7 +124,7 @@ podtrans recommend --cpu-only --cpu-cores 16
 podtrans recommend --apple-generation 4 --unified-gb 24
 ```
 
-在 macOS 上，`transcribe`、`diarize` 和 `speaker-service` 省略 `--profile` 时会选用检测到的档位。程序把档位名写到标准错误，例如 `podtrans: using profile apple-m4-16gb`。写在后面的参数覆盖档位里的同名参数。Linux 上省略 `--profile` 时，这三个命令保持各自的默认参数。`diarize-batch` 在每个系统上都会选择一个档位。
+在 macOS 上，`transcribe`、`diarize` 和 `speaker-service` 省略 `--profile` 时会选用检测到的档位。程序把档位名写到标准错误，例如 `podtrans: using profile apple-m4-16gb`。写在后面的参数覆盖档位里的同名参数。Linux 上省略 `--profile` 时，这三个命令保持各自的默认参数。`diarize-batch` 在每个系统上都会选择一个档位。Rosetta（x86_64）进程不会被检测为 Apple 档位，而是使用 `cpu`。
 
 Apple 档位的名称是 `apple-m{代}-{档}gb`。`podtrans profiles` 列出 M1 到 M5。更新的芯片在被写进这张表之前，仍然按同一规则解析，例如 `apple-m6-16gb`。代际 1 和 2 共用一套批次。代际 3 及以后共用另一套。统一内存按 8、16、32、64GB 向下取整。24GB 的 M4 得到 `apple-m4-16gb`。低于 8GB 的 Apple 芯片使用该代的 8GB 档。
 
