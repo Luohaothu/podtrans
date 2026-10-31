@@ -2,11 +2,29 @@ name: test
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            tier: cpu
+            build: true
+          - name: macos-arm64
+            os: macos-15
+            tier: apple
+            build: false
     steps:
       - uses: actions/checkout@v5
       - name: Install uv
@@ -22,9 +40,25 @@ jobs:
         run: uv run --frozen python -m unittest discover -s tests -v
       - name: Smoke test installed CLI
         run: uv run --frozen podtrans --version
+      - name: Assert recommended profile
+        shell: bash
+        run: |
+          help="$(uv run --frozen podtrans recommend --help)"
+          name="$(uv run --frozen podtrans recommend --name-only)"
+          if printf '%s\n' "$help" | grep -q -- '--apple-generation'; then
+            if [ "${{ matrix.tier }}" = "apple" ]; then
+              printf '%s\n' "$name" | grep -Eq '^apple-m[0-9]+-[0-9]+gb$'
+            else
+              [ "$name" = "cpu" ]
+            fi
+          else
+            [ "$name" = "cpu" ]
+          fi
       - name: Build wheel and source distribution
+        if: matrix.build
         run: uv build
       - name: Verify wheel installation and console entry point
+        if: matrix.build
         run: |
           uv venv /tmp/podtrans-wheel-test
           uv pip install \
