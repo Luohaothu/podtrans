@@ -1,11 +1,12 @@
 # podtrans
 
-`podtrans` 是一套可安装的播客归档、FunASR 转录和说话人标注 CLI。项目使用 uv 管理依赖与锁文件；安装后统一通过 `podtrans <command>` 使用，不需要执行仓库中的 Python 或 Shell 脚本。
+`podtrans` 是一套可安装的播客归档、转录和说话人标注 CLI。项目使用 uv 管理依赖与锁文件；安装后统一通过 `podtrans <command>` 使用，不需要执行仓库中的 Python 或 Shell 脚本。
 
 ## 功能
 
 - 从 RSS 拉取节目元数据、音频和 shownotes，并生成完整性报告。
 - 使用 `FunAudioLLM/Fun-ASR-Nano-2512` 批量转录归档音频。
+- 可以把转录指到兼容 OpenAI `/v1/audio/transcriptions` 的服务，也可以用 `diarize-batch --attach` 接入已经启动的说话人服务。
 - 使用 FunASR VAD 与 `iic/speech_eres2netv2_sv_zh-cn_16k-common` 生成说话人标签。
 - 用一个独立 GPU 服务加载说话人模型，多个 worker 通过 Unix socket 共享权重。
 - 支持 CPU-only 运行、任务分片、错误重试、最终校验和硬件预设。
@@ -208,6 +209,31 @@ podtrans transcribe \
 
 用户参数位于预设参数之后，因此具有更高优先级。4GB 至 8GB 档位默认使用 FunASR AutoModel，避免 vLLM 额外显存开销；12GB 及以上 Ampere 或更新的 NVIDIA GPU 默认使用 BF16 vLLM。ASR 模型不变。
 
+## 外部转录服务
+
+`podtrans transcribe --asr-url` 把分片音频发给兼容 OpenAI `/v1/audio/transcriptions` 的服务。Faster-Whisper、Whisper.cpp 的 HTTP 服务，以及带密钥的云端接口都属于这一类。这条路径不安装，也不导入 FunASR。机器上仍需要 `ffmpeg` 在 `PATH` 里。
+
+密钥只从环境变量 `PODTRANS_ASR_API_KEY` 读取。命令行和 `transcript.json` 都不写密钥。成功的转录在 `meta.asr_url` 里只记录校验后的服务根地址。
+
+```bash
+export PODTRANS_ASR_API_KEY=sk-local
+
+podtrans transcribe \
+  --asr-url http://127.0.0.1:8000/v1 \
+  --model Systran/faster-whisper-large-v3 \
+  --language zh \
+  --chunk-seconds 300 \
+  --batch-size 4
+```
+
+服务不校验密钥时，可以不设置 `PODTRANS_ASR_API_KEY`。
+
+`--asr-url` 是已经包含 `/v1` 的 API 根。以 `/audio/transcriptions` 结尾的完整地址也可以。带用户信息或查询字符串的 URL 会失败。远程模式必须写出 `--model`，不会套用 FunASR 的默认模型名。`--language auto` 时请求不带 language，由服务自己检测。`--batch-size` 是同一批里同时发出的分片请求数。Whisper 一类服务建议把 `--chunk-seconds` 设为 `300`。不写这个参数时默认仍是 `30`，以免改变本机 FunASR 的切分。
+
+`--profile`、`--backend`、`--device`、`--batch-size-s`、`--max-length`，以及 `--tensor-parallel-size` 和全部 `--vllm-*`，只描述本进程里的 FunASR。它们和 `--asr-url` 一起出现时命令失败。
+
+服务只返回文本、没有词级时间时，分片里的 `timestamps` 是空数组 `[]`。后面的说话人标注会按原有规则把文本摊到这个分片的时间窗上。
+
 ## 说话人标注
 
 CPU 模式在当前进程中加载模型：
@@ -222,7 +248,7 @@ GPU 高并发模式：
 podtrans diarize-batch --profile gpu-24gb
 ```
 
-`diarize-batch` 的执行顺序：
+不带 `--attach` 时，`diarize-batch` 的执行顺序：
 
 1. 启动一个独立说话人嵌入服务。
 2. 等待 Unix socket 健康检查通过。
@@ -241,7 +267,7 @@ podtrans diarize-batch \
   --limit 10
 ```
 
-也可以手工管理共享服务：
+也可以手工管理共享服务。单个 worker 直接带上 socket。一批 worker 必须显式传入 `--attach`。socket 已经存在时，批命令不会自己改成附着模式。
 
 ```bash
 podtrans speaker-service --profile gpu-24gb
@@ -249,7 +275,18 @@ podtrans speaker-service --profile gpu-24gb
 podtrans diarize \
   --profile gpu-24gb \
   --speaker-service-socket /tmp/podtrans-speaker-embedding.sock
+
+podtrans diarize-batch \
+  --profile gpu-24gb \
+  --attach \
+  -- \
+  --channel "示例播客" \
+  --limit 10
 ```
+
+`--attach` 只检查 socket 健康，然后启动分片 worker。它不删除 socket，不清空服务日志，也不会在退出或收到 SIGINT 时停止这个服务。worker 使用的 `--speaker-service-socket` 由批命令自己传入。在 `--` 后面再转发这个参数会失败。
+
+不带 `--attach` 时，如果 socket 已经健康，`diarize-batch` 拒绝删掉它，并提示改用 `--attach` 或先停止服务。CPU profile 在没有 `--attach` 时仍在当前进程里做单路标注。加上 `--attach` 后，说话人模型走 socket，即使 VAD 留在 CPU。
 
 说话人模型保持 FunASR 加载后的官方 FP32 权重，不调用 `half()` 或其他强制低精度转换。TF32 也不会隐式启用。
 
