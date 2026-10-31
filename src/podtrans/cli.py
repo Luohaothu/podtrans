@@ -10,13 +10,15 @@ from collections.abc import Callable
 
 from . import __version__
 from .profiles import (
-    command_arguments,
-    detect_nvidia_gpu,
-    get_profile,
+    Family,
+    Machine,
+    floor_note,
     listed_profiles,
+    machine_from_probe,
     profile_json,
+    resolve_command_argv,
     resolved_profile,
-    select_profile,
+    select_machine,
 )
 
 
@@ -72,29 +74,11 @@ Validation and benchmarks:
 
 Use `podtrans <command> --help` for command-specific options.
 Profile-aware commands accept `--profile NAME`; later options override it.
+On Apple Silicon, transcribe, diarize, and speaker-service select a profile when `--profile` is omitted.
+Linux commands without `--profile` keep their own defaults.
+diarize-batch always selects a profile. Apple and CPU profiles diarize in-process.
 """
     )
-
-
-def extract_profile(argv: list[str]) -> tuple[str | None, list[str]]:
-    profile: str | None = None
-    remaining: list[str] = []
-    index = 0
-    while index < len(argv):
-        value = argv[index]
-        if value == "--profile":
-            if index + 1 >= len(argv):
-                raise ValueError("--profile requires a value")
-            profile = argv[index + 1]
-            index += 2
-            continue
-        if value.startswith("--profile="):
-            profile = value.split("=", 1)[1]
-            index += 1
-            continue
-        remaining.append(value)
-        index += 1
-    return profile, remaining
 
 
 def profiles_main(argv: list[str]) -> int:
@@ -126,30 +110,38 @@ def profiles_main(argv: list[str]) -> int:
     return 0
 
 
+def _hardware_line(machine: Machine, cpu_cores: int | None) -> str:
+    if machine.family is Family.NVIDIA and machine.vram is not None:
+        return f"{machine.label} ({machine.vram.gb:.1f}GB)"
+    if machine.family is Family.APPLE and machine.apple is not None:
+        return f"{machine.label} ({machine.apple.unified_gb:.1f}GB unified)"
+    cores = cpu_cores or os.cpu_count() or 1
+    return f"CPU ({cores} cores)"
+
+
 def recommend_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="podtrans recommend")
     parser.add_argument("--vram-gb", type=float)
     parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument("--apple-generation", type=int)
+    parser.add_argument("--unified-gb", type=float)
     parser.add_argument("--cpu-cores", type=int)
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true")
     output.add_argument("--name-only", action="store_true")
     args = parser.parse_args(argv)
-    if args.vram_gb is not None and args.vram_gb <= 0:
-        parser.error("--vram-gb must be positive")
     if args.cpu_cores is not None and args.cpu_cores <= 0:
         parser.error("--cpu-cores must be positive")
-
-    detected_name: str | None = None
-    detected_vram = args.vram_gb
-    if args.cpu_only:
-        detected_vram = None
-    elif detected_vram is None:
-        detected = detect_nvidia_gpu()
-        if detected is not None:
-            detected_name, detected_vram = detected
-
-    profile = select_profile(detected_vram)
+    try:
+        machine = machine_from_probe(
+            cpu_only=args.cpu_only,
+            vram_gb=args.vram_gb,
+            apple_generation=args.apple_generation,
+            unified_gb=args.unified_gb,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    profile = select_machine(machine)
     if args.name_only:
         print(profile.name)
         return 0
@@ -157,22 +149,17 @@ def recommend_main(argv: list[str]) -> int:
         print(profile_json(profile, cpu_cores=args.cpu_cores))
         return 0
 
-    hardware = (
-        f"{detected_name or 'GPU'} ({detected_vram:.1f}GB)"
-        if detected_vram is not None
-        else f"CPU ({args.cpu_cores or os.cpu_count() or 1} cores)"
-    )
     config = resolved_profile(profile, cpu_cores=args.cpu_cores)
-    print(f"hardware: {hardware}")
+    print(f"hardware: {_hardware_line(machine, args.cpu_cores)}")
     print(f"profile: {profile.name}")
-    print(f"notes: {profile.notes}")
+    print(f"notes: {floor_note(machine, profile)}")
     print()
     print(f"podtrans transcribe --profile {profile.name}")
-    if profile.name == "cpu":
-        print(f"podtrans diarize --profile {profile.name}")
-    else:
+    if profile.uses_speaker_service:
         print(f"podtrans diarize-batch --profile {profile.name}")
         print(f"recommended worker shards: {config['worker_shards']}")
+    else:
+        print(f"podtrans diarize --profile {profile.name}")
     return 0
 
 
@@ -212,12 +199,8 @@ def main(argv: list[str] | None = None) -> int:
             return recommend_main(command_args)
         if command not in COMMANDS:
             raise ValueError(f"unknown command {command!r}")
-        profile_name = None
         if command in PROFILE_AWARE_COMMANDS:
-            profile_name, command_args = extract_profile(command_args)
-        if profile_name is not None:
-            profile = get_profile(profile_name)
-            command_args = command_arguments(profile, command) + command_args
+            command_args = resolve_command_argv(command, command_args)
         entry = load_command(command)
         try:
             return int(entry(command_args))

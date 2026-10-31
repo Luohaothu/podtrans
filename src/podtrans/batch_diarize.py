@@ -12,12 +12,11 @@ from pathlib import Path
 
 from . import archive
 from .profiles import (
-    PROFILES,
-    command_arguments,
-    detect_nvidia_gpu,
+    detect_machine,
     get_profile,
+    resolve_command_argv,
     resolved_profile,
-    select_profile,
+    select_machine,
 )
 
 
@@ -72,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="podtrans diarize-batch",
         description=__doc__,
     )
-    parser.add_argument("--profile", choices=PROFILES)
+    parser.add_argument("--profile")
     parser.add_argument("--workers", type=int)
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     parser.add_argument("--service-timeout", type=float, default=300)
@@ -90,22 +89,28 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("timeouts must be positive and stagger must be non-negative")
 
     if args.profile:
-        profile = get_profile(args.profile)
+        try:
+            profile = get_profile(args.profile)
+        except ValueError as exc:
+            parser.error(str(exc))
     else:
-        detected = detect_nvidia_gpu()
-        profile = select_profile(detected[1] if detected else None)
+        profile = select_machine(detect_machine())
+        print(f"podtrans: using profile {profile.name}", file=sys.stderr)
     config = resolved_profile(profile)
     forwarded = list(args.diarize_args)
     if forwarded[:1] == ["--"]:
         forwarded = forwarded[1:]
 
-    if profile.name == "cpu":
+    if not profile.uses_speaker_service:
         if args.workers not in {None, 1}:
-            parser.error("the CPU profile supports exactly one in-process worker")
+            parser.error(f"{profile.name} supports exactly one in-process worker")
         from .diarize import main as diarize_main
 
         return diarize_main(
-            command_arguments(profile, "diarize") + forwarded
+            resolve_command_argv(
+                "diarize",
+                ["--profile", profile.name, *forwarded],
+            )
         )
 
     workers = args.workers or int(config["worker_shards"])
@@ -120,7 +125,8 @@ def main(argv: list[str] | None = None) -> int:
     service_command = [
         *executable,
         "speaker-service",
-        *command_arguments(profile, "speaker-service"),
+        "--profile",
+        profile.name,
         "--socket",
         str(args.socket),
         "--status-file",
@@ -167,7 +173,8 @@ def main(argv: list[str] | None = None) -> int:
                 command = [
                     *executable,
                     "diarize",
-                    *command_arguments(profile, "diarize"),
+                    "--profile",
+                    profile.name,
                     *forwarded,
                     "--speaker-service-socket",
                     str(args.socket),
