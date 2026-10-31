@@ -336,6 +336,17 @@ class ResolveArgvTests(unittest.TestCase):
         self.assertEqual(args[args.index("--batch-size", args.index("--batch-size") + 1) + 1], "3")
         self.assertEqual(stderr.getvalue(), "")
 
+    def test_last_explicit_profile_wins(self) -> None:
+        args = resolve_command_argv(
+            "transcribe",
+            ["--profile", "cpu", "--profile=gpu-8gb"],
+            platform="darwin",
+        )
+        self.assertEqual(flag(args, "--device"), "cuda")
+        self.assertEqual(flag(args, "--backend"), "auto")
+        self.assertNotIn("--profile", args)
+        self.assertNotIn("--profile=gpu-8gb", args)
+
     def test_help_does_not_select_a_profile(self) -> None:
         args = resolve_command_argv(
             "transcribe",
@@ -385,7 +396,10 @@ class CliProfileTests(unittest.TestCase):
         with redirect_stdout(output):
             exit_code = cli.main(["--help"])
         self.assertEqual(exit_code, 0)
-        self.assertIn("diarize-batch", output.getvalue())
+        text = output.getvalue()
+        self.assertIn("diarize-batch", text)
+        self.assertIn("Apple Silicon", text)
+        self.assertIn("Linux commands without `--profile`", text)
 
     def test_runtime_missing_dependency_has_install_hint(self) -> None:
         error = ModuleNotFoundError("No module named 'funasr'", name="funasr")

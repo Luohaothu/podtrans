@@ -115,18 +115,31 @@ podtrans profiles
 podtrans profiles --json
 ```
 
-自动读取 NVIDIA GPU 名称和显存并给出配置：
+`podtrans recommend` 读取本机硬件。NVIDIA GPU 按显存选择档位。Apple Silicon 按芯片代际和统一内存选择档位。其他机器使用 CPU。
 
 ```bash
 podtrans recommend
-```
-
-没有 NVIDIA GPU 时自动选择 CPU。也可手工指定：
-
-```bash
 podtrans recommend --vram-gb 16 --cpu-cores 12
 podtrans recommend --cpu-only --cpu-cores 16
+podtrans recommend --apple-generation 4 --unified-gb 24
 ```
+
+在 macOS 上，`transcribe`、`diarize` 和 `speaker-service` 省略 `--profile` 时会选用检测到的档位。程序把档位名写到标准错误，例如 `podtrans: using profile apple-m4-16gb`。写在后面的参数覆盖档位里的同名参数。Linux 上省略 `--profile` 时，这三个命令保持各自的默认参数。`diarize-batch` 在每个系统上都会选择一个档位。
+
+Apple 档位的名称是 `apple-m{代}-{档}gb`。`podtrans profiles` 列出 M1 到 M5。更新的芯片在被写进这张表之前，仍然按同一规则解析，例如 `apple-m6-16gb`。代际 1 和 2 共用一套批次。代际 3 及以后共用另一套。统一内存按 8、16、32、64GB 向下取整。24GB 的 M4 得到 `apple-m4-16gb`。低于 8GB 的 Apple 芯片使用该代的 8GB 档。
+
+`--apple-generation` 和 `--unified-gb` 必须一起给出，并且不能和 `--vram-gb` 或 `--cpu-only` 同时使用。
+
+所有 Apple 档位都使用 Fun-ASR-Nano。M1 和 M2 在 16GB 及以下把 ASR 放在 CPU 上，32GB 及以上使用 MPS。M3 及更新的芯片从 16GB 起使用 MPS，8GB 仍在 CPU 上。说话人模型和 VAD 留在 CPU 上。标注在当前进程完成，不启动 `speaker-service`。这些档位还没有在项目机器上跑过。具体批次以 `podtrans profiles` 为准。
+
+固定档位，或只改一个参数：
+
+```bash
+podtrans transcribe --profile apple-m2-16gb --device mps
+podtrans diarize --profile apple-m4-16gb --speaker-batch-size 16
+```
+
+`speaker-service --profile apple-m4-16gb` 会失败，因为这个档位不使用说话人服务。
 
 推荐值是保守起点，worker 数还会按照本机 CPU 核数收缩，避免每个进程的特征提取线程造成 CPU 过量争用。
 
@@ -142,7 +155,7 @@ GPU 档位使用 `min(profile 最大 worker, CPU 核心数 // 4)`，并继续限
 
 | Profile | 典型显卡 | ASR 后端 | ASR batch | 说话人 batch | 最大 worker |
 | --- | --- | --- | ---: | ---: | ---: |
-| `cpu` | 无可用 GPU | AutoModel/CPU | 1 | 32 | 1 |
+| `cpu` | x86-64 CPU | AutoModel/CPU | 1 | 32 | 1 |
 | `gpu-4gb` | GTX 1650、RTX 3050 4GB | AutoModel | 1 | 32 | 1 |
 | `gpu-6gb` | RTX 2060、RTX 3050 6GB | AutoModel | 1 | 64 | 2 |
 | `gpu-8gb` | RTX 3060 Ti、RTX 4060、RTX 5060 | AutoModel | 2 | 128 | 2 |
@@ -156,7 +169,7 @@ GPU 档位使用 `min(profile 最大 worker, CPU 核心数 // 4)`，并继续限
 
 NVIDIA CUDA 是当前验证路径。AMD RX 7600 8GB、7700 XT 12GB、7800 XT/7900 GRE 16GB、7900 XT 20GB、7900 XTX 24GB 可按同显存档位作为参数起点，但需要兼容的 ROCm PyTorch/FunASR/vLLM 环境；无法满足运行时兼容性时应使用 `cpu`。
 
-`gpu-48gb` 来自项目实际节点验证。其他档位按显存和 CPU 供给保守缩放，应先用少量节目验证，再根据峰值显存、GPU 利用率和 CPU 特征提取速度提高参数。
+`gpu-48gb` 来自项目实际节点验证。其他 NVIDIA 档位和全部 Apple 档位按显存、统一内存和 CPU 核数保守缩放，应先用少量节目验证，再根据峰值显存、GPU 利用率和 CPU 特征提取速度提高参数。`profiles --json` 里只有 `gpu-48gb` 的 `validated_on_host` 为 true。
 
 ## 准备配置
 
@@ -198,6 +211,8 @@ profile="$(podtrans recommend --name-only)"
 podtrans transcribe --profile "${profile}"
 ```
 
+在 Apple Silicon 上也可以直接运行 `podtrans transcribe`。命令会套用检测到的档位，并把 `podtrans: using profile <name>` 写到标准错误。后面的参数仍然优先。Linux 上省略 `--profile` 时，本命令保持自己的默认值。
+
 指定 24GB 档位，并覆盖一个预设参数：
 
 ```bash
@@ -215,6 +230,14 @@ CPU 模式在当前进程中加载模型：
 ```bash
 podtrans diarize --profile cpu
 ```
+
+Apple Silicon 档位同样在当前进程加载说话人模型：
+
+```bash
+podtrans diarize --profile apple-m4-16gb
+```
+
+`diarize-batch` 遇到 Apple 档位或 CPU 档位时不启动 `speaker-service`，并且只允许一个 worker。
 
 GPU 高并发模式：
 
