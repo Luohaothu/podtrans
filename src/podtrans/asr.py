@@ -1,5 +1,3 @@
-"""In-process FunASR and OpenAI-compatible remote transcription."""
-
 from __future__ import annotations
 
 import json
@@ -81,8 +79,6 @@ class WordStamp:
 
 @dataclass(frozen=True)
 class AsrSource:
-    """Identity written into transcript.json. endpoint is None for in-process ASR."""
-
     model: str
     backend: str
     device: str
@@ -120,15 +116,16 @@ class VllmAsr:
 
 @dataclass(frozen=True)
 class RemoteAsr:
-    """base_url is the validated root. transcription_url is derived from it."""
-
     base_url: str
-    transcription_url: str
     model: str
     api_key: str | None = field(repr=False, default=None)
     language: str | None = None
     batch_size: int = _DEFAULT_BATCH_SIZE
     timeout_seconds: float = _DEFAULT_REMOTE_TIMEOUT_SECONDS
+
+    @property
+    def transcription_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/audio/transcriptions"
 
 
 AsrSpec = AutoModelAsr | VllmAsr | RemoteAsr
@@ -152,7 +149,6 @@ class _FormatRejected(Exception):
 
 
 def parse_asr_spec(args: Any) -> AsrSpec:
-    """Validate CLI and env at the boundary. Trust the returned spec after this."""
     batch_size = _require_positive_int(getattr(args, "batch_size", None), "--batch-size")
     if args.asr_url:
         for attr, flag in _IN_PROCESS_FIELDS:
@@ -161,7 +157,7 @@ def parse_asr_spec(args: Any) -> AsrSpec:
         model = getattr(args, "model", None)
         if not isinstance(model, str) or not model.strip():
             raise ValueError("--model is required with --asr-url")
-        base_url, transcription_url = _asr_endpoint(args.asr_url)
+        base_url = _asr_endpoint(args.asr_url)
         language = getattr(args, "language", None)
         if language in (None, "", "auto"):
             language = None
@@ -172,7 +168,6 @@ def parse_asr_spec(args: Any) -> AsrSpec:
             raise ValueError("PODTRANS_ASR_API_KEY must not contain a newline")
         return RemoteAsr(
             base_url=base_url,
-            transcription_url=transcription_url,
             model=model.strip(),
             api_key=api_key,
             language=language,
@@ -227,18 +222,12 @@ def parse_asr_spec(args: Any) -> AsrSpec:
 
 
 def open_asr(spec: AsrSpec) -> AsrSession:
-    """Match the closed spec. The only constructor the episode loop uses."""
     if isinstance(spec, RemoteAsr):
-        return RemoteAsrSession(spec)
-    return LocalAsrSession(spec)
+        return _RemoteAsrSession(spec)
+    return _LocalAsrSession(spec)
 
 
 def _parse_transcription_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Map an OpenAI transcription JSON object onto a chunk dict.
-
-    Prefer top-level words, then flattened segment words, then one stamp per
-    segment. No words and no segments yield timestamps: [].
-    """
     if not isinstance(payload, dict):
         raise ValueError("transcription response must be a JSON object")
     text = payload.get("text")
@@ -336,7 +325,7 @@ def _require_positive_int(value: Any, flag: str) -> int:
     return value
 
 
-def _asr_endpoint(raw: str) -> tuple[str, str]:
+def _asr_endpoint(raw: str) -> str:
     if not isinstance(raw, str):
         raise ValueError("--asr-url must be an http or https URL")
     parsed = urllib.parse.urlparse(raw.strip())
@@ -352,12 +341,9 @@ def _asr_endpoint(raw: str) -> tuple[str, str]:
     transcription_suffix = "/audio/transcriptions"
     if path.endswith(transcription_suffix):
         parent = path[: -len(transcription_suffix)].rstrip("/")
-        return (_url_with_path(parsed, parent), _url_with_path(parsed, path))
+        return _url_with_path(parsed, parent)
     if path.endswith("/v1"):
-        return (
-            _url_with_path(parsed, path),
-            _url_with_path(parsed, path + transcription_suffix),
-        )
+        return _url_with_path(parsed, path)
     raise ValueError("--asr-url must end in /v1 or /audio/transcriptions")
 
 
@@ -365,7 +351,7 @@ def _url_with_path(parsed: urllib.parse.ParseResult, path: str) -> str:
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
-class RemoteAsrSession:
+class _RemoteAsrSession:
     def __init__(self, spec: RemoteAsr) -> None:
         self.source = AsrSource(
             model=spec.model,
@@ -485,9 +471,7 @@ class RemoteAsrSession:
         return _parse_transcription_payload(_decode_json_object(raw))
 
 
-class LocalAsrSession:
-    """FunASR AutoModel or AutoModelVLLM. Imports funasr inside methods."""
-
+class _LocalAsrSession:
     def __init__(self, spec: AutoModelAsr | VllmAsr) -> None:
         self._spec = spec
         self._force_single = False

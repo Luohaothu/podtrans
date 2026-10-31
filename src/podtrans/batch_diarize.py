@@ -165,7 +165,6 @@ def spawn_speaker_service(
     profile: HardwareProfile,
     timeout_seconds: float,
 ) -> SpawnedSpeakerService:
-    """Start speaker-service unless the socket is already healthy."""
     if socket.exists() and _socket_is_healthy(socket, timeout_seconds):
         raise RuntimeError(
             f"speaker socket {socket} is already healthy; "
@@ -210,7 +209,6 @@ def spawn_speaker_service(
 
 
 def attach_speaker_service(socket: Path, timeout_seconds: float) -> AttachedSpeakerService:
-    """Wait until health status is ok. Do not start, stop, or unlink the service."""
     _wait_until_ready(socket, timeout_seconds, None)
     return AttachedSpeakerService(socket)
 
@@ -225,7 +223,6 @@ def run_workers(
     worker_processes: list[subprocess.Popen[str]],
     service_pid: int | None,
 ) -> int:
-    """Start shard workers against socket. Does not start or stop a service."""
     metadata_dir = archive.ROOT / "_metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     worker_pid_path = metadata_dir / "speaker_diarization_worker_pids"
