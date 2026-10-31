@@ -10,10 +10,10 @@ from collections.abc import Callable
 
 from . import __version__
 from .profiles import (
-    PROFILES,
     command_arguments,
     detect_nvidia_gpu,
     get_profile,
+    listed_profiles,
     profile_json,
     resolved_profile,
     select_profile,
@@ -109,19 +109,19 @@ def profiles_main(argv: list[str]) -> int:
 
         payload = [
             resolved_profile(profile, cpu_cores=args.cpu_cores)
-            for profile in PROFILES.values()
+            for profile in listed_profiles()
         ]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
-    print("PROFILE    VRAM   ASR       SPK_BATCH  MAX_WORKERS  EXAMPLES")
-    for profile in PROFILES.values():
-        config = resolved_profile(profile, cpu_cores=args.cpu_cores)
-        vram = "CPU" if profile.vram_gb is None else f"{profile.vram_gb}GB"
-        examples = "; ".join(profile.examples)
+    print(
+        f"{'PROFILE':<16} {'FAMILY':<8} {'MEMORY':<14} "
+        f"{'ASR_PAIR':<30} {'SPK_BATCH':<10} MODE"
+    )
+    for profile in listed_profiles():
         print(
-            f"{profile.name:<10} {vram:<6} {profile.asr_backend:<9} "
-            f"{profile.speaker_batch_size:<10} "
-            f"{config['worker_shards']:<12} {examples}"
+            f"{profile.name:<16} {profile.family.value:<8} "
+            f"{profile.memory_label():<14} {profile.asr_pair_label():<30} "
+            f"{profile.speaker.batch_size:<10} {profile.mode_label()}"
         )
     return 0
 

@@ -4,22 +4,180 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
-from dataclasses import asdict, dataclass
-from typing import Any
+import sys
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Literal
+
+
+ASR_NANO = "FunAudioLLM/Fun-ASR-Nano-2512"
+SPEAKER_ERES2NET_V2 = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
+VAD_FSMN = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+VLLM_DTYPE = "bfloat16"
+
+# Printer bound. Selection accepts any positive M-series generation.
+LISTED_APPLE_GENERATION_MAX = 5
+
+_APPLE_NAME = re.compile(r"^apple-m(\d+)-(\d+)gb$")
+_APPLE_BRAND = re.compile(r"^Apple M(\d+)\b")
+_PROBE_TIMEOUT_SECONDS = 5
+
+ProbeRunner = Callable[[Sequence[str]], Any]
+
+
+class Family(Enum):
+    CPU = "cpu"
+    NVIDIA = "nvidia"
+    APPLE = "apple"
+
+
+@dataclass(frozen=True)
+class Vram:
+    """Discrete NVIDIA memory, in GB. Never unified memory."""
+
+    gb: float
+
+    def __post_init__(self) -> None:
+        if self.gb <= 0:
+            raise ValueError("VRAM must be positive")
+
+
+@dataclass(frozen=True)
+class AppleChip:
+    """One Apple Silicon chip. The Pro, Max, or Ultra variant is not a selection key."""
+
+    generation: int
+    unified_gb: float
+    brand: str
+
+    def __post_init__(self) -> None:
+        if self.generation < 1:
+            raise ValueError("Apple generation must be >= 1")
+        if self.unified_gb <= 0:
+            raise ValueError("unified memory must be positive")
+
+
+@dataclass(frozen=True)
+class Machine:
+    """One detected or previewed computer. Discrete VRAM and an Apple chip never coexist."""
+
+    family: Family
+    label: str
+    vram: Vram | None = None
+    apple: AppleChip | None = None
+
+    def __post_init__(self) -> None:
+        if self.family is Family.NVIDIA:
+            if self.vram is None or self.apple is not None:
+                raise ValueError("an NVIDIA machine carries discrete VRAM and no Apple chip")
+        elif self.family is Family.APPLE:
+            if self.apple is None or self.vram is not None:
+                raise ValueError("an Apple machine carries an Apple chip and no discrete VRAM")
+        elif self.family is Family.CPU:
+            if self.vram is not None or self.apple is not None:
+                raise ValueError("a CPU machine carries neither VRAM nor an Apple chip")
+        else:
+            raise ValueError(f"unknown machine family {self.family!r}")
+
+
+@dataclass(frozen=True)
+class FunasrAuto:
+    model: str
+    device: Literal["cpu", "cuda", "mps"]
+
+    def __post_init__(self) -> None:
+        if self.device not in {"cpu", "cuda", "mps"}:
+            raise ValueError("auto backend device must be cpu, cuda, or mps")
+
+
+@dataclass(frozen=True)
+class FunasrVllm:
+    """vLLM engine. The device is CUDA because vLLM does not run on MPS or CPU."""
+
+    model: str
+    memory_utilization: float
+    dtype: str = VLLM_DTYPE
+    device: Literal["cuda"] = "cuda"
+
+    def __post_init__(self) -> None:
+        if self.device != "cuda":
+            raise ValueError("vLLM only runs on CUDA")
+        if not 0 < self.memory_utilization < 1:
+            raise ValueError("vLLM memory utilization must be in (0, 1)")
+
+
+AsrPair = FunasrAuto | FunasrVllm
+
+
+@dataclass(frozen=True)
+class InProcessSpeaker:
+    model: str
+    device: Literal["cpu", "mps"]
+    vad_model: str
+    vad_device: Literal["cpu", "mps"]
+    batch_size: int
+
+    def __post_init__(self) -> None:
+        if self.device not in {"cpu", "mps"}:
+            raise ValueError("in-process speaker device must be cpu or mps")
+        if self.vad_device not in {"cpu", "mps"}:
+            raise ValueError("VAD device must be cpu or mps")
+        if self.batch_size <= 0:
+            raise ValueError("speaker batch size must be positive")
+
+
+@dataclass(frozen=True)
+class SpeakerService:
+    """Shared CUDA speaker service. diarize-batch is what starts it."""
+
+    model: str
+    batch_size: int
+    device: Literal["cuda"] = "cuda"
+
+    def __post_init__(self) -> None:
+        if self.device != "cuda":
+            raise ValueError("speaker-service only runs on CUDA")
+        if self.batch_size <= 0:
+            raise ValueError("speaker batch size must be positive")
+
+
+SpeakerPlacement = InProcessSpeaker | SpeakerService
+
+
+@dataclass(frozen=True)
+class CpuKey:
+    pass
+
+
+@dataclass(frozen=True)
+class VramKey:
+    gb: int
+
+
+@dataclass(frozen=True)
+class UnifiedKey:
+    """The rung that was selected, not the machine's raw unified size."""
+
+    generation: int
+    memory_gb: int
+
+
+MatchKey = CpuKey | VramKey | UnifiedKey
 
 
 @dataclass(frozen=True)
 class HardwareProfile:
     name: str
-    vram_gb: int | None
+    match: MatchKey
     examples: tuple[str, ...]
-    asr_backend: str
+    asr: AsrPair
+    speaker: SpeakerPlacement
     asr_batch_size: int
     asr_job_batch_size: int
     asr_decode_workers: int
-    vllm_memory_utilization: float | None
-    speaker_batch_size: int
     diarize_job_batch_size: int
     diarize_decode_workers: int
     max_worker_shards: int
@@ -28,199 +186,586 @@ class HardwareProfile:
     notes: str
     validated_on_host: bool = False
 
+    def __post_init__(self) -> None:
+        if isinstance(self.match, VramKey):
+            if not isinstance(self.speaker, SpeakerService):
+                raise ValueError("NVIDIA profiles use speaker-service")
+            if self.asr.device != "cuda":
+                raise ValueError("NVIDIA ASR must run on CUDA")
+        elif isinstance(self.match, UnifiedKey):
+            if not isinstance(self.asr, FunasrAuto) or self.asr.device not in {"cpu", "mps"}:
+                raise ValueError("Apple ASR uses the auto backend on cpu or mps")
+            if not isinstance(self.speaker, InProcessSpeaker):
+                raise ValueError("Apple profiles run diarization in-process")
+            if self.speaker.device != "cpu" or self.speaker.vad_device != "cpu":
+                raise ValueError("Apple speaker and VAD stay on CPU")
+        elif isinstance(self.match, CpuKey):
+            if not isinstance(self.asr, FunasrAuto) or self.asr.device != "cpu":
+                raise ValueError("the CPU profile runs ASR on CPU")
+            if not isinstance(self.speaker, InProcessSpeaker) or self.speaker.device != "cpu":
+                raise ValueError("the CPU profile runs diarization in-process on CPU")
+        else:
+            raise ValueError("unknown profile match")
 
-PROFILES: dict[str, HardwareProfile] = {
-    "cpu": HardwareProfile(
-        name="cpu",
-        vram_gb=None,
-        examples=("x86-64 CPU", "Apple Silicon CPU"),
-        asr_backend="auto",
+    @property
+    def uses_speaker_service(self) -> bool:
+        return isinstance(self.speaker, SpeakerService)
+
+    @property
+    def family(self) -> Family:
+        if isinstance(self.match, VramKey):
+            return Family.NVIDIA
+        if isinstance(self.match, UnifiedKey):
+            return Family.APPLE
+        return Family.CPU
+
+    def memory_label(self) -> str:
+        if isinstance(self.match, VramKey):
+            return f"{self.match.gb}GB vram"
+        if isinstance(self.match, UnifiedKey):
+            return f"{self.match.memory_gb}GB unified"
+        return "CPU"
+
+    def asr_pair_label(self) -> str:
+        backend = "vllm" if isinstance(self.asr, FunasrVllm) else "auto"
+        model = self.asr.model.rsplit("/", 1)[-1]
+        return f"{backend}/{model}@{self.asr.device}"
+
+    def mode_label(self) -> str:
+        if self.uses_speaker_service:
+            return "service"
+        return "in-process"
+
+
+@dataclass(frozen=True)
+class AppleRung:
+    """One memory floor inside a capability class. Generation is applied at materialize time."""
+
+    memory_gb: int
+    asr: FunasrAuto
+    speaker_device: Literal["cpu", "mps"]
+    asr_batch_size: int
+    asr_job_batch_size: int
+    asr_decode_workers: int
+    speaker_batch_size: int
+    diarize_job_batch_size: int
+    diarize_decode_workers: int
+    notes: str
+
+
+def _nano(device: Literal["cpu", "cuda", "mps"]) -> FunasrAuto:
+    return FunasrAuto(ASR_NANO, device)
+
+
+# generation <= 2 reads EARLY_RUNGS. generation >= 3 reads MODERN_RUNGS.
+# M5 and later stay on the modern ladder until a measured pair diverges.
+EARLY_RUNGS: tuple[AppleRung, ...] = (
+    AppleRung(
+        memory_gb=8,
+        asr=_nano("cpu"),
+        speaker_device="cpu",
+        asr_batch_size=1,
+        asr_job_batch_size=1,
+        asr_decode_workers=1,
+        speaker_batch_size=16,
+        diarize_job_batch_size=1,
+        diarize_decode_workers=1,
+        notes=(
+            "Fun-ASR-Nano on CPU with small batches. "
+            "8GB unified leaves no room for MPS copies. "
+            "Speaker and VAD stay on CPU. Unvalidated starting point."
+        ),
+    ),
+    AppleRung(
+        memory_gb=16,
+        asr=_nano("cpu"),
+        speaker_device="cpu",
         asr_batch_size=1,
         asr_job_batch_size=1,
         asr_decode_workers=2,
-        vllm_memory_utilization=None,
         speaker_batch_size=32,
+        diarize_job_batch_size=1,
+        diarize_decode_workers=2,
+        notes=(
+            "Fun-ASR-Nano on CPU. Early MPS is not assumed correct for this 800M checkpoint. "
+            "Unvalidated starting point."
+        ),
+    ),
+    AppleRung(
+        memory_gb=32,
+        asr=_nano("mps"),
+        speaker_device="cpu",
+        asr_batch_size=1,
+        asr_job_batch_size=1,
+        asr_decode_workers=2,
+        speaker_batch_size=32,
+        diarize_job_batch_size=1,
+        diarize_decode_workers=2,
+        notes=(
+            "Fun-ASR-Nano on MPS. 32GB is the early-chip headroom for MPS fallback copies. "
+            "Speaker stays on CPU. Unvalidated starting point."
+        ),
+    ),
+    AppleRung(
+        memory_gb=64,
+        asr=_nano("mps"),
+        speaker_device="cpu",
+        asr_batch_size=2,
+        asr_job_batch_size=1,
+        asr_decode_workers=2,
+        speaker_batch_size=64,
+        diarize_job_batch_size=1,
+        diarize_decode_workers=2,
+        notes=(
+            "Same Nano-on-MPS pair as the 32GB early rung, with a larger ASR batch. "
+            "Unvalidated starting point."
+        ),
+    ),
+)
+
+MODERN_RUNGS: tuple[AppleRung, ...] = (
+    AppleRung(
+        memory_gb=8,
+        asr=_nano("cpu"),
+        speaker_device="cpu",
+        asr_batch_size=1,
+        asr_job_batch_size=1,
+        asr_decode_workers=2,
+        speaker_batch_size=16,
+        diarize_job_batch_size=1,
+        diarize_decode_workers=2,
+        notes=(
+            "Fun-ASR-Nano on CPU. A newer GPU does not move the 8GB rung onto MPS. "
+            "Speaker and VAD stay on CPU. Unvalidated starting point."
+        ),
+    ),
+    AppleRung(
+        memory_gb=16,
+        asr=_nano("mps"),
+        speaker_device="cpu",
+        asr_batch_size=1,
+        asr_job_batch_size=1,
+        asr_decode_workers=2,
+        speaker_batch_size=32,
+        diarize_job_batch_size=1,
+        diarize_decode_workers=2,
+        notes=(
+            "Fun-ASR-Nano on MPS. Modern GPU, batch 1. Speaker and VAD stay on CPU. "
+            "Unvalidated starting point."
+        ),
+    ),
+    AppleRung(
+        memory_gb=32,
+        asr=_nano("mps"),
+        speaker_device="cpu",
+        asr_batch_size=2,
+        asr_job_batch_size=2,
+        asr_decode_workers=4,
+        speaker_batch_size=64,
+        diarize_job_batch_size=2,
+        diarize_decode_workers=2,
+        notes="Fun-ASR-Nano on MPS, batch 2. Unvalidated starting point.",
+    ),
+    AppleRung(
+        memory_gb=64,
+        asr=_nano("mps"),
+        speaker_device="cpu",
+        asr_batch_size=4,
+        asr_job_batch_size=2,
+        asr_decode_workers=4,
+        speaker_batch_size=128,
+        diarize_job_batch_size=2,
+        diarize_decode_workers=4,
+        notes=(
+            "Fun-ASR-Nano on MPS, batch 4. Still one in-process diarize worker. "
+            "Unvalidated starting point."
+        ),
+    ),
+)
+
+
+def _rungs_for(generation: int) -> tuple[AppleRung, ...]:
+    if generation <= 2:
+        return EARLY_RUNGS
+    return MODERN_RUNGS
+
+
+def _materialize_apple(generation: int, rung: AppleRung) -> HardwareProfile:
+    return HardwareProfile(
+        name=f"apple-m{generation}-{rung.memory_gb}gb",
+        match=UnifiedKey(generation, rung.memory_gb),
+        examples=(f"Apple M{generation} with at least {rung.memory_gb}GB unified",),
+        asr=rung.asr,
+        speaker=InProcessSpeaker(
+            model=SPEAKER_ERES2NET_V2,
+            device=rung.speaker_device,
+            vad_model=VAD_FSMN,
+            vad_device="cpu",
+            batch_size=rung.speaker_batch_size,
+        ),
+        asr_batch_size=rung.asr_batch_size,
+        asr_job_batch_size=rung.asr_job_batch_size,
+        asr_decode_workers=rung.asr_decode_workers,
+        diarize_job_batch_size=rung.diarize_job_batch_size,
+        diarize_decode_workers=rung.diarize_decode_workers,
+        max_worker_shards=1,
+        handler_workers=0,
+        max_queued_requests=0,
+        notes=rung.notes,
+    )
+
+
+def _cpu_profile() -> HardwareProfile:
+    return HardwareProfile(
+        name="cpu",
+        match=CpuKey(),
+        examples=("x86-64 CPU",),
+        asr=_nano("cpu"),
+        speaker=InProcessSpeaker(
+            SPEAKER_ERES2NET_V2,
+            "cpu",
+            VAD_FSMN,
+            "cpu",
+            batch_size=32,
+        ),
+        asr_batch_size=1,
+        asr_job_batch_size=1,
+        asr_decode_workers=2,
         diarize_job_batch_size=1,
         diarize_decode_workers=2,
         max_worker_shards=1,
         handler_workers=0,
         max_queued_requests=0,
-        notes="CPU-only fallback; runs diarization in-process without the GPU service.",
-    ),
-    "gpu-4gb": HardwareProfile(
-        name="gpu-4gb",
-        vram_gb=4,
-        examples=("GeForce GTX 1650 4GB", "GeForce RTX 3050 4GB"),
-        asr_backend="auto",
-        asr_batch_size=1,
-        asr_job_batch_size=1,
-        asr_decode_workers=1,
-        vllm_memory_utilization=None,
-        speaker_batch_size=32,
-        diarize_job_batch_size=1,
-        diarize_decode_workers=1,
-        max_worker_shards=1,
-        handler_workers=1,
-        max_queued_requests=2,
-        notes="Tight VRAM tier; use AutoModel and fall back to CPU if model loading fails.",
-    ),
-    "gpu-6gb": HardwareProfile(
-        name="gpu-6gb",
-        vram_gb=6,
-        examples=("GeForce RTX 2060 6GB", "GeForce RTX 3050 6GB"),
-        asr_backend="auto",
-        asr_batch_size=1,
-        asr_job_batch_size=1,
-        asr_decode_workers=2,
-        vllm_memory_utilization=None,
-        speaker_batch_size=64,
-        diarize_job_batch_size=1,
-        diarize_decode_workers=2,
-        max_worker_shards=2,
-        handler_workers=1,
-        max_queued_requests=2,
-        notes="Uses the lower-overhead AutoModel backend; no forced low precision.",
-    ),
-    "gpu-8gb": HardwareProfile(
-        name="gpu-8gb",
-        vram_gb=8,
-        examples=(
-            "GeForce RTX 3060 Ti 8GB",
-            "GeForce RTX 4060 8GB",
-            "GeForce RTX 5060 8GB",
+        notes=(
+            "CPU-only fallback; runs diarization in-process without the GPU service. "
+            "Apple Silicon machines resolve to apple-m* profiles, not this one."
         ),
-        asr_backend="auto",
-        asr_batch_size=2,
-        asr_job_batch_size=2,
-        asr_decode_workers=2,
-        vllm_memory_utilization=None,
-        speaker_batch_size=128,
-        diarize_job_batch_size=2,
-        diarize_decode_workers=2,
-        max_worker_shards=2,
-        handler_workers=2,
-        max_queued_requests=4,
-        notes="Conservative CUDA profile for common 8GB cards.",
-    ),
-    "gpu-12gb": HardwareProfile(
-        name="gpu-12gb",
-        vram_gb=12,
-        examples=(
-            "GeForce RTX 3060 12GB",
-            "GeForce RTX 4070 12GB",
-            "GeForce RTX 5070 12GB",
+    )
+
+
+def _gpu(
+    gb: int,
+    examples: tuple[str, ...],
+    asr: AsrPair,
+    asr_batch_size: int,
+    asr_job_batch_size: int,
+    asr_decode_workers: int,
+    speaker_batch_size: int,
+    diarize_job_batch_size: int,
+    diarize_decode_workers: int,
+    max_worker_shards: int,
+    handler_workers: int,
+    max_queued_requests: int,
+    notes: str,
+    *,
+    validated_on_host: bool = False,
+) -> HardwareProfile:
+    return HardwareProfile(
+        name=f"gpu-{gb}gb",
+        match=VramKey(gb),
+        examples=examples,
+        asr=asr,
+        speaker=SpeakerService(SPEAKER_ERES2NET_V2, speaker_batch_size),
+        asr_batch_size=asr_batch_size,
+        asr_job_batch_size=asr_job_batch_size,
+        asr_decode_workers=asr_decode_workers,
+        diarize_job_batch_size=diarize_job_batch_size,
+        diarize_decode_workers=diarize_decode_workers,
+        max_worker_shards=max_worker_shards,
+        handler_workers=handler_workers,
+        max_queued_requests=max_queued_requests,
+        notes=notes,
+        validated_on_host=validated_on_host,
+    )
+
+
+def _nvidia_profiles() -> tuple[HardwareProfile, ...]:
+    auto = _nano("cuda")
+    return (
+        _gpu(
+            4,
+            ("GeForce GTX 1650 4GB", "GeForce RTX 3050 4GB"),
+            auto,
+            1,
+            1,
+            1,
+            32,
+            1,
+            1,
+            1,
+            1,
+            2,
+            "Tight VRAM tier; use AutoModel and fall back to CPU if model loading fails.",
         ),
-        asr_backend="vllm",
-        asr_batch_size=4,
-        asr_job_batch_size=2,
-        asr_decode_workers=3,
-        vllm_memory_utilization=0.84,
-        speaker_batch_size=256,
-        diarize_job_batch_size=2,
-        diarize_decode_workers=3,
-        max_worker_shards=3,
-        handler_workers=2,
-        max_queued_requests=4,
-        notes="BF16 vLLM starting point for Ampere-or-newer GPUs.",
-    ),
-    "gpu-16gb": HardwareProfile(
-        name="gpu-16gb",
-        vram_gb=16,
-        examples=(
-            "GeForce RTX 4060 Ti 16GB",
-            "GeForce RTX 4070 Ti SUPER 16GB",
-            "GeForce RTX 4080 / 5080 16GB",
-            "GeForce RTX 5060 Ti / 5070 Ti 16GB",
+        _gpu(
+            6,
+            ("GeForce RTX 2060 6GB", "GeForce RTX 3050 6GB"),
+            auto,
+            1,
+            1,
+            2,
+            64,
+            1,
+            2,
+            2,
+            1,
+            2,
+            "Uses the lower-overhead AutoModel backend; no forced low precision.",
         ),
-        asr_backend="vllm",
-        asr_batch_size=6,
-        asr_job_batch_size=3,
-        asr_decode_workers=4,
-        vllm_memory_utilization=0.87,
-        speaker_batch_size=384,
-        diarize_job_batch_size=3,
-        diarize_decode_workers=4,
-        max_worker_shards=4,
-        handler_workers=2,
-        max_queued_requests=4,
-        notes="Mainstream 16GB BF16 vLLM profile.",
-    ),
-    "gpu-24gb": HardwareProfile(
-        name="gpu-24gb",
-        vram_gb=24,
-        examples=(
-            "GeForce RTX 3090 / 3090 Ti 24GB",
-            "GeForce RTX 4090 24GB",
+        _gpu(
+            8,
+            (
+                "GeForce RTX 3060 Ti 8GB",
+                "GeForce RTX 4060 8GB",
+                "GeForce RTX 5060 8GB",
+            ),
+            auto,
+            2,
+            2,
+            2,
+            128,
+            2,
+            2,
+            2,
+            2,
+            4,
+            "Conservative CUDA profile for common 8GB cards.",
         ),
-        asr_backend="vllm",
-        asr_batch_size=8,
-        asr_job_batch_size=4,
-        asr_decode_workers=4,
-        vllm_memory_utilization=0.90,
-        speaker_batch_size=512,
-        diarize_job_batch_size=4,
-        diarize_decode_workers=4,
-        max_worker_shards=6,
-        handler_workers=3,
-        max_queued_requests=6,
-        notes="High-throughput single-GPU profile; increase only after a short validation run.",
-    ),
-    "gpu-32gb": HardwareProfile(
-        name="gpu-32gb",
-        vram_gb=32,
-        examples=("GeForce RTX 5090 32GB",),
-        asr_backend="vllm",
-        asr_batch_size=12,
-        asr_job_batch_size=4,
-        asr_decode_workers=6,
-        vllm_memory_utilization=0.92,
-        speaker_batch_size=1024,
-        diarize_job_batch_size=4,
-        diarize_decode_workers=4,
-        max_worker_shards=8,
-        handler_workers=3,
-        max_queued_requests=6,
-        notes="32GB consumer flagship starting point.",
-    ),
-    "gpu-48gb": HardwareProfile(
-        name="gpu-48gb",
-        vram_gb=48,
-        examples=("48GB modified or workstation-class NVIDIA GPU",),
-        asr_backend="vllm",
-        asr_batch_size=16,
-        asr_job_batch_size=6,
-        asr_decode_workers=8,
-        vllm_memory_utilization=0.92,
-        speaker_batch_size=1536,
-        diarize_job_batch_size=4,
-        diarize_decode_workers=4,
-        max_worker_shards=16,
-        handler_workers=3,
-        max_queued_requests=6,
-        notes="Validated project host profile; one shared FP32 speaker service.",
-        validated_on_host=True,
-    ),
-}
+        _gpu(
+            12,
+            (
+                "GeForce RTX 3060 12GB",
+                "GeForce RTX 4070 12GB",
+                "GeForce RTX 5070 12GB",
+            ),
+            FunasrVllm(ASR_NANO, 0.84),
+            4,
+            2,
+            3,
+            256,
+            2,
+            3,
+            3,
+            2,
+            4,
+            "BF16 vLLM starting point for Ampere-or-newer GPUs.",
+        ),
+        _gpu(
+            16,
+            (
+                "GeForce RTX 4060 Ti 16GB",
+                "GeForce RTX 4070 Ti SUPER 16GB",
+                "GeForce RTX 4080 / 5080 16GB",
+                "GeForce RTX 5060 Ti / 5070 Ti 16GB",
+            ),
+            FunasrVllm(ASR_NANO, 0.87),
+            6,
+            3,
+            4,
+            384,
+            3,
+            4,
+            4,
+            2,
+            4,
+            "Mainstream 16GB BF16 vLLM profile.",
+        ),
+        _gpu(
+            24,
+            (
+                "GeForce RTX 3090 / 3090 Ti 24GB",
+                "GeForce RTX 4090 24GB",
+            ),
+            FunasrVllm(ASR_NANO, 0.90),
+            8,
+            4,
+            4,
+            512,
+            4,
+            4,
+            6,
+            3,
+            6,
+            "High-throughput single-GPU profile; increase only after a short validation run.",
+        ),
+        _gpu(
+            32,
+            ("GeForce RTX 5090 32GB",),
+            FunasrVllm(ASR_NANO, 0.92),
+            12,
+            4,
+            6,
+            1024,
+            4,
+            4,
+            8,
+            3,
+            6,
+            "32GB consumer flagship starting point.",
+        ),
+        _gpu(
+            48,
+            ("48GB modified or workstation-class NVIDIA GPU",),
+            FunasrVllm(ASR_NANO, 0.92),
+            16,
+            6,
+            8,
+            1536,
+            4,
+            4,
+            16,
+            3,
+            6,
+            "Validated project host profile; one shared FP32 speaker service.",
+            validated_on_host=True,
+        ),
+    )
+
+
+def _apple_profiles() -> tuple[HardwareProfile, ...]:
+    return tuple(
+        _materialize_apple(generation, rung)
+        for generation in range(1, LISTED_APPLE_GENERATION_MAX + 1)
+        for rung in _rungs_for(generation)
+    )
+
+
+def _vram_key_gb(profile: HardwareProfile) -> int:
+    match = profile.match
+    if not isinstance(match, VramKey):
+        raise RuntimeError(f"{profile.name} is not a VRAM profile")
+    return match.gb
+
+
+def _validate_catalog(profiles: tuple[HardwareProfile, ...]) -> None:
+    names = [profile.name for profile in profiles]
+    if len(names) != len(set(names)):
+        raise RuntimeError("profile names must be unique")
+    for capability in (EARLY_RUNGS, MODERN_RUNGS):
+        floors = [rung.memory_gb for rung in capability]
+        if floors != sorted(floors) or len(floors) != len(set(floors)):
+            raise RuntimeError("Apple memory rungs must be strictly increasing")
+        for rung in capability:
+            if rung.asr.model != ASR_NANO:
+                raise RuntimeError("Apple rungs use Fun-ASR-Nano")
+    nvidia = [profile for profile in profiles if isinstance(profile.match, VramKey)]
+    expected = {
+        "gpu-4gb": 4,
+        "gpu-6gb": 6,
+        "gpu-8gb": 8,
+        "gpu-12gb": 12,
+        "gpu-16gb": 16,
+        "gpu-24gb": 24,
+        "gpu-32gb": 32,
+        "gpu-48gb": 48,
+    }
+    if {profile.name: _vram_key_gb(profile) for profile in nvidia} != expected:
+        raise RuntimeError("NVIDIA tiers drifted from the historical VRAM floors")
+    for profile in nvidia:
+        gb = _vram_key_gb(profile)
+        if gb <= 8 and not isinstance(profile.asr, FunasrAuto):
+            raise RuntimeError(f"{profile.name} stays on the auto backend")
+        if gb >= 12 and not isinstance(profile.asr, FunasrVllm):
+            raise RuntimeError(f"{profile.name} stays on vLLM")
+    listed_apple = {
+        f"apple-m{generation}-{rung.memory_gb}gb"
+        for generation in range(1, LISTED_APPLE_GENERATION_MAX + 1)
+        for rung in _rungs_for(generation)
+    }
+    found_apple = {profile.name for profile in profiles if profile.family is Family.APPLE}
+    if found_apple != listed_apple:
+        raise RuntimeError("listed Apple profiles must be the generation by rung catalog")
+    for profile in profiles:
+        if profile.family is Family.APPLE and profile.validated_on_host:
+            raise RuntimeError(f"{profile.name} is not validated on the project host")
+        if isinstance(profile.asr, FunasrVllm) and not isinstance(profile.match, VramKey):
+            raise RuntimeError("vLLM profiles require a VRAM key")
+
+
+_CPU_PROFILE = _cpu_profile()
+_NVIDIA_PROFILES = _nvidia_profiles()
+_LISTED = (_CPU_PROFILE, *_NVIDIA_PROFILES, *_apple_profiles())
+_validate_catalog(_LISTED)
+PROFILES: dict[str, HardwareProfile] = {profile.name: profile for profile in _LISTED}
+
+
+def listed_profiles() -> tuple[HardwareProfile, ...]:
+    return _LISTED
+
+
+def _unknown_profile(name: str) -> ValueError:
+    choices = ", ".join(profile.name for profile in _LISTED)
+    return ValueError(f"unknown profile {name!r}; choose one of: {choices}")
 
 
 def get_profile(name: str) -> HardwareProfile:
-    try:
-        return PROFILES[name]
-    except KeyError as exc:
-        choices = ", ".join(PROFILES)
-        raise ValueError(f"unknown profile {name!r}; choose one of: {choices}") from exc
+    found = PROFILES.get(name)
+    if found is not None:
+        return found
+    match = _APPLE_NAME.fullmatch(name)
+    if match is None:
+        raise _unknown_profile(name)
+    generation = int(match.group(1))
+    memory = int(match.group(2))
+    if generation < 1 or f"apple-m{generation}-{memory}gb" != name:
+        raise _unknown_profile(name)
+    rungs = _rungs_for(generation)
+    for rung in rungs:
+        if rung.memory_gb == memory:
+            return _materialize_apple(generation, rung)
+    if memory <= 0:
+        raise _unknown_profile(name)
+    floored = select_machine(
+        Machine(
+            Family.APPLE,
+            f"Apple M{generation}",
+            apple=AppleChip(generation, float(memory), f"Apple M{generation}"),
+        )
+    )
+    raise ValueError(
+        f"unknown profile {name!r}; {memory}GB is not an Apple memory rung, "
+        f"{floored.name} is the floor for that chip"
+    )
+
+
+def _floor_rung(rungs: tuple[AppleRung, ...], unified_gb: float) -> AppleRung:
+    chosen = rungs[0]
+    for rung in rungs:
+        if rung.memory_gb <= unified_gb:
+            chosen = rung
+        else:
+            break
+    return chosen
+
+
+def _select_nvidia(vram: Vram | None) -> HardwareProfile:
+    if vram is None or vram.gb < 4:
+        return _CPU_PROFILE
+    eligible = [
+        profile for profile in _NVIDIA_PROFILES if _vram_key_gb(profile) <= vram.gb
+    ]
+    if not eligible:
+        return _CPU_PROFILE
+    return max(eligible, key=_vram_key_gb)
+
+
+def select_machine(machine: Machine) -> HardwareProfile:
+    if machine.family is Family.NVIDIA:
+        return _select_nvidia(machine.vram)
+    if machine.family is Family.APPLE:
+        chip = machine.apple
+        if chip is None:
+            raise ValueError("an Apple machine requires an Apple chip")
+        rung = _floor_rung(_rungs_for(chip.generation), chip.unified_gb)
+        return _materialize_apple(chip.generation, rung)
+    return _CPU_PROFILE
 
 
 def select_profile(vram_gb: float | None) -> HardwareProfile:
+    """VRAM floor kept for callers that only know a discrete-memory number."""
     if vram_gb is None or vram_gb < 4:
-        return PROFILES["cpu"]
-    gpu_profiles = [
-        profile for profile in PROFILES.values() if profile.vram_gb is not None
-    ]
-    eligible = [profile for profile in gpu_profiles if profile.vram_gb <= vram_gb]
-    if not eligible:
-        return PROFILES["cpu"]
-    return max(eligible, key=lambda profile: profile.vram_gb or 0)
+        return select_machine(Machine(Family.CPU, "CPU"))
+    return select_machine(Machine(Family.NVIDIA, "GPU", vram=Vram(vram_gb)))
 
 
 def resolved_profile(
@@ -229,7 +774,7 @@ def resolved_profile(
     cpu_cores: int | None = None,
 ) -> dict[str, Any]:
     cores = max(1, cpu_cores or os.cpu_count() or 1)
-    if profile.name == "cpu":
+    if isinstance(profile.speaker, InProcessSpeaker):
         worker_shards = 1
         worker_cpu_threads = min(16, cores)
         decode_workers = min(profile.diarize_decode_workers, max(1, cores // 4))
@@ -249,19 +794,55 @@ def resolved_profile(
         profile.handler_workers,
         max(1, cores // 8),
     )
-    payload = asdict(profile)
-    payload.update(
-        {
-            "cpu_cores": cores,
-            "worker_shards": worker_shards,
-            "worker_cpu_threads": worker_cpu_threads,
-            "asr_decode_workers": asr_decode_workers,
-            "diarize_decode_workers": decode_workers,
-            "service_cpu_threads": service_cpu_threads,
-            "handler_workers": handler_workers,
-        }
-    )
-    return payload
+    asr = profile.asr
+    speaker = profile.speaker
+    match = profile.match
+    if isinstance(speaker, InProcessSpeaker):
+        vad_model = speaker.vad_model
+        vad_device = speaker.vad_device
+    else:
+        vad_model = VAD_FSMN
+        vad_device = "cpu"
+    return {
+        "name": profile.name,
+        "vram_gb": match.gb if isinstance(match, VramKey) else None,
+        "examples": list(profile.examples),
+        "asr_backend": "vllm" if isinstance(asr, FunasrVllm) else "auto",
+        "asr_batch_size": profile.asr_batch_size,
+        "asr_job_batch_size": profile.asr_job_batch_size,
+        "asr_decode_workers": asr_decode_workers,
+        "vllm_memory_utilization": (
+            asr.memory_utilization if isinstance(asr, FunasrVllm) else None
+        ),
+        "speaker_batch_size": speaker.batch_size,
+        "diarize_job_batch_size": profile.diarize_job_batch_size,
+        "diarize_decode_workers": decode_workers,
+        "max_worker_shards": profile.max_worker_shards,
+        "handler_workers": handler_workers,
+        "max_queued_requests": profile.max_queued_requests,
+        "notes": profile.notes,
+        "validated_on_host": profile.validated_on_host,
+        "cpu_cores": cores,
+        "worker_shards": worker_shards,
+        "worker_cpu_threads": worker_cpu_threads,
+        "service_cpu_threads": service_cpu_threads,
+        "family": profile.family.value,
+        "asr_model": asr.model,
+        "asr_device": asr.device,
+        "speaker_model": speaker.model,
+        "speaker_device": speaker.device,
+        "vad_model": vad_model,
+        "vad_device": vad_device,
+        "speaker_mode": "speaker_service" if profile.uses_speaker_service else "in_process",
+        "apple_generation": match.generation if isinstance(match, UnifiedKey) else None,
+        "unified_memory_gb": match.memory_gb if isinstance(match, UnifiedKey) else None,
+    }
+
+
+def _flag_device(device: str, *, cuda_index: bool) -> str:
+    if cuda_index and device == "cuda":
+        return "cuda:0"
+    return device
 
 
 def command_arguments(
@@ -271,12 +852,15 @@ def command_arguments(
     cpu_cores: int | None = None,
 ) -> list[str]:
     config = resolved_profile(profile, cpu_cores=cpu_cores)
+    asr = profile.asr
     if command == "transcribe":
         args = [
+            "--model",
+            asr.model,
             "--backend",
-            profile.asr_backend,
+            "vllm" if isinstance(asr, FunasrVllm) else "auto",
             "--device",
-            "cpu" if profile.name == "cpu" else "cuda",
+            asr.device,
             "--batch-size",
             str(profile.asr_batch_size),
             "--job-batch-size",
@@ -284,24 +868,35 @@ def command_arguments(
             "--decode-workers",
             str(config["asr_decode_workers"]),
         ]
-        if profile.vllm_memory_utilization is not None:
+        if isinstance(asr, FunasrVllm):
             args.extend(
                 [
                     "--vllm-dtype",
-                    "bfloat16",
+                    asr.dtype,
                     "--vllm-gpu-memory-utilization",
-                    str(profile.vllm_memory_utilization),
+                    str(asr.memory_utilization),
                 ]
             )
         return args
     if command == "diarize":
+        speaker = profile.speaker
+        if isinstance(speaker, InProcessSpeaker):
+            vad_model = speaker.vad_model
+            vad_device = speaker.vad_device
+        else:
+            vad_model = VAD_FSMN
+            vad_device = "cpu"
         return [
+            "--speaker-model",
+            speaker.model,
+            "--vad-model",
+            vad_model,
             "--device",
-            "cpu" if profile.name == "cpu" else "cuda:0",
+            _flag_device(speaker.device, cuda_index=True),
             "--vad-device",
-            "cpu",
+            vad_device,
             "--speaker-batch-size",
-            str(profile.speaker_batch_size),
+            str(speaker.batch_size),
             "--job-batch-size",
             str(profile.diarize_job_batch_size),
             "--decode-workers",
@@ -310,18 +905,18 @@ def command_arguments(
             str(config["worker_cpu_threads"]),
         ]
     if command == "speaker-service":
-        if profile.name == "cpu":
+        if not isinstance(profile.speaker, SpeakerService):
             raise ValueError(
-                "the CPU profile runs diarization in-process and does not use "
+                f"{profile.name} runs diarization in-process and does not use "
                 "speaker-service"
             )
         return [
             "--device",
             "cuda:0",
             "--max-batch-size",
-            str(profile.speaker_batch_size),
+            str(profile.speaker.batch_size),
             "--warmup-batch-size",
-            str(profile.speaker_batch_size),
+            str(profile.speaker.batch_size),
             "--cpu-threads",
             str(config["service_cpu_threads"]),
             "--handler-workers",
@@ -332,30 +927,195 @@ def command_arguments(
     raise ValueError(f"profiles are not supported by command {command!r}")
 
 
-def detect_nvidia_gpu() -> tuple[str, float] | None:
+def _run_probe(command: Sequence[str], runner: ProbeRunner | None) -> Any:
+    if runner is not None:
+        return runner(command)
+    return subprocess.run(
+        list(command),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=_PROBE_TIMEOUT_SECONDS,
+    )
+
+
+def detect_nvidia_gpu(runner: ProbeRunner | None = None) -> tuple[str, float] | None:
     try:
-        result = subprocess.run(
+        result = _run_probe(
             [
                 "nvidia-smi",
                 "--query-gpu=name,memory.total",
                 "--format=csv,noheader,nounits",
             ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
+            runner,
         )
-    except (FileNotFoundError, subprocess.SubprocessError):
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
         return None
     devices: list[tuple[str, float]] = []
-    for line in result.stdout.splitlines():
+    for line in str(result.stdout).splitlines():
         try:
             name, memory_mib = line.rsplit(",", 1)
             nominal_gb = round(float(memory_mib.strip()) / 1024, 1)
-            devices.append((name.strip(), nominal_gb))
         except ValueError:
             continue
+        if nominal_gb <= 0:
+            continue
+        devices.append((name.strip(), nominal_gb))
     return max(devices, key=lambda item: item[1]) if devices else None
+
+
+def _detect_apple(
+    *,
+    platform: str | None = None,
+    runner: ProbeRunner | None = None,
+) -> AppleChip | None:
+    if (sys.platform if platform is None else platform) != "darwin":
+        return None
+    try:
+        result = _run_probe(
+            ["sysctl", "-n", "machdep.cpu.brand_string", "hw.memsize"],
+            runner,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None
+    lines = str(result.stdout).splitlines()
+    if len(lines) < 2:
+        return None
+    brand = lines[0].strip()
+    brand_match = _APPLE_BRAND.match(brand)
+    if brand_match is None:
+        return None
+    try:
+        mem_bytes = int(lines[1].strip())
+    except ValueError:
+        return None
+    if mem_bytes <= 0:
+        return None
+    unified_gb = round(mem_bytes / 1024**3, 1)
+    if unified_gb <= 0:
+        return None
+    return AppleChip(int(brand_match.group(1)), unified_gb, brand)
+
+
+def detect_machine(
+    *,
+    platform: str | None = None,
+    nvidia_runner: ProbeRunner | None = None,
+    apple_runner: ProbeRunner | None = None,
+) -> Machine:
+    detected = detect_nvidia_gpu(runner=nvidia_runner)
+    if detected is not None:
+        name, gb = detected
+        return Machine(Family.NVIDIA, name, vram=Vram(gb))
+    chip = _detect_apple(platform=platform, runner=apple_runner)
+    if chip is not None:
+        return Machine(Family.APPLE, chip.brand, apple=chip)
+    return Machine(Family.CPU, "CPU")
+
+
+def machine_from_probe(
+    *,
+    cpu_only: bool = False,
+    vram_gb: float | None = None,
+    apple_generation: int | None = None,
+    unified_gb: float | None = None,
+) -> Machine:
+    has_generation = apple_generation is not None
+    has_unified = unified_gb is not None
+    if has_generation != has_unified:
+        raise ValueError("--apple-generation and --unified-gb must be set together")
+    selected = sum((bool(cpu_only), vram_gb is not None, has_generation))
+    if selected > 1:
+        raise ValueError(
+            "choose only one of --cpu-only, --vram-gb, or Apple generation and unified memory"
+        )
+    if vram_gb is not None:
+        if vram_gb <= 0:
+            raise ValueError("--vram-gb must be positive")
+        return Machine(Family.NVIDIA, "GPU", vram=Vram(vram_gb))
+    if has_generation:
+        if apple_generation is None or apple_generation < 1:
+            raise ValueError("--apple-generation must be >= 1")
+        if unified_gb is None or unified_gb <= 0:
+            raise ValueError("--unified-gb must be positive")
+        brand = f"Apple M{apple_generation}"
+        return Machine(
+            Family.APPLE,
+            brand,
+            apple=AppleChip(apple_generation, unified_gb, brand),
+        )
+    if cpu_only:
+        return Machine(Family.CPU, "CPU")
+    return detect_machine()
+
+
+def floor_note(machine: Machine, profile: HardwareProfile) -> str:
+    notes = profile.notes
+    chip = machine.apple
+    match = profile.match
+    if chip is not None and isinstance(match, UnifiedKey) and chip.unified_gb > match.memory_gb:
+        notes = (
+            f"{notes} {chip.unified_gb:.1f}GB unified floors to the {match.memory_gb}GB rung."
+        )
+    return notes
+
+
+_IMPLICIT_COMMANDS = frozenset({"transcribe", "diarize", "speaker-service"})
+
+
+def _implicit_profile(command: str, *, platform: str | None = None) -> bool:
+    current = sys.platform if platform is None else platform
+    return command in _IMPLICIT_COMMANDS and current == "darwin"
+
+
+def _skips_profile(command: str, argv: Sequence[str]) -> bool:
+    if "-h" in argv or "--help" in argv:
+        return True
+    return command == "speaker-service" and "--check" in argv
+
+
+def extract_profile(argv: Sequence[str]) -> tuple[str | None, list[str]]:
+    profile: str | None = None
+    remaining: list[str] = []
+    index = 0
+    values = list(argv)
+    while index < len(values):
+        value = values[index]
+        if value == "--profile":
+            if index + 1 >= len(values):
+                raise ValueError("--profile requires a value")
+            profile = values[index + 1]
+            index += 2
+            continue
+        if value.startswith("--profile="):
+            profile = value.split("=", 1)[1]
+            index += 1
+            continue
+        remaining.append(value)
+        index += 1
+    return profile, remaining
+
+
+def resolve_command_argv(
+    command: str,
+    argv: Sequence[str],
+    *,
+    machine: Machine | None = None,
+    platform: str | None = None,
+) -> list[str]:
+    args = list(argv)
+    if _skips_profile(command, args):
+        return args
+    name, rest = extract_profile(args)
+    if name is None and not _implicit_profile(command, platform=platform):
+        return args
+    if name is None:
+        chosen = machine if machine is not None else detect_machine(platform=platform)
+        profile = select_machine(chosen)
+        print(f"podtrans: using profile {profile.name}", file=sys.stderr)
+    else:
+        profile = get_profile(name)
+    return command_arguments(profile, command) + rest
 
 
 def profile_json(profile: HardwareProfile, *, cpu_cores: int | None = None) -> str:

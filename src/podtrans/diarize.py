@@ -24,11 +24,11 @@ from typing import Any, Iterable
 import numpy as np
 
 from . import archive
+from .profiles import SPEAKER_ERES2NET_V2 as DEFAULT_SPEAKER_MODEL
+from .profiles import VAD_FSMN as DEFAULT_VAD_MODEL
 
 
 ROOT = archive.ROOT
-DEFAULT_SPEAKER_MODEL = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
-DEFAULT_VAD_MODEL = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 DEFAULT_OUTPUT_PREFIX = "transcript_speakers"
 DEFAULT_SPEAKER_BATCH_SIZE = 512
 DEFAULT_MERGE_THRESHOLD = 0.60

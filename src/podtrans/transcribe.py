@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from . import archive
+from .profiles import ASR_NANO as DEFAULT_MODEL
 
 
 ROOT = archive.ROOT
-DEFAULT_MODEL = "FunAudioLLM/Fun-ASR-Nano-2512"
 REPORT_FILE = ROOT / "_metadata" / "transcription_report.json"
 MANIFEST_FILE = ROOT / "_metadata" / "transcription_manifest.jsonl"
 
