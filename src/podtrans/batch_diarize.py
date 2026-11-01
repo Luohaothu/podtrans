@@ -12,11 +12,10 @@ from pathlib import Path
 
 from . import archive
 from .profiles import (
-    detect_machine,
-    get_profile,
+    SelectionRequest,
     resolve_command_argv,
+    resolve_profile_selection,
     resolved_profile,
-    select_machine,
 )
 
 
@@ -71,7 +70,11 @@ def main(argv: list[str] | None = None) -> int:
         prog="podtrans diarize-batch",
         description=__doc__,
     )
-    parser.add_argument("--profile")
+    parser.add_argument("--profile", help="auto, quality, speed, or a catalog profile id")
+    parser.add_argument("--apple-generation", type=int)
+    parser.add_argument("--unified-gb", type=float)
+    parser.add_argument("--vram-gb", type=float)
+    parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--workers", type=int)
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     parser.add_argument("--service-timeout", type=float, default=300)
@@ -88,14 +91,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.service_timeout <= 0 or args.worker_start_stagger < 0:
         parser.error("timeouts must be positive and stagger must be non-negative")
 
-    if args.profile:
-        try:
-            profile = get_profile(args.profile)
-        except ValueError as exc:
-            parser.error(str(exc))
-    else:
-        profile = select_machine(detect_machine())
-        print(f"podtrans: using profile {profile.name}", file=sys.stderr)
+    try:
+        profile, announcement = resolve_profile_selection(
+            SelectionRequest(
+                profile=args.profile,
+                apple_generation=args.apple_generation,
+                unified_gb=args.unified_gb,
+                vram_gb=args.vram_gb,
+                cpu_only=args.cpu_only,
+            ),
+            detect=True,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if announcement is not None:
+        print(f"podtrans: using profile {announcement}", file=sys.stderr)
     config = resolved_profile(profile)
     forwarded = list(args.diarize_args)
     if forwarded[:1] == ["--"]:

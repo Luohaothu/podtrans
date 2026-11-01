@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Literal
 
@@ -19,8 +19,8 @@ SPEAKER_ERES2NET_V2 = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
 VAD_FSMN = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 VLLM_DTYPE = "bfloat16"
 
-# profiles --json / text list generations 1..N. get_profile and select_machine
-# still materialize later M-series generations from the same ladders.
+# Listed catalog covers generations 1..N. get_profile / query_apple_profile
+# still materialize later M-series generations from the same recipe table.
 LISTED_APPLE_GENERATION_MAX = 5
 
 _APPLE_NAME = re.compile(r"^apple-m(\d+)-(\d+)gb$")
@@ -237,10 +237,16 @@ class HardwareProfile:
         return "in-process"
 
 
-@dataclass(frozen=True)
-class AppleRung:
-    """One unified-memory floor. _materialize_apple stamps the generation onto the name."""
+def _nano(device: Literal["cpu", "cuda", "mps"]) -> FunasrAuto:
+    return FunasrAuto(ASR_NANO, device)
 
+
+@dataclass(frozen=True)
+class AppleRecipe:
+    """One pre-compiled Apple catalog row: generation band × unified-memory floor."""
+
+    generation_lo: int
+    generation_hi: int | None
     memory_gb: int
     asr: FunasrAuto
     asr_batch_size: int
@@ -251,121 +257,138 @@ class AppleRung:
     diarize_decode_workers: int
     notes: str
 
+    def covers(self, generation: int) -> bool:
+        if generation < self.generation_lo:
+            return False
+        if self.generation_hi is None:
+            return True
+        return generation <= self.generation_hi
 
-def _nano(device: Literal["cpu", "cuda", "mps"]) -> FunasrAuto:
-    return FunasrAuto(ASR_NANO, device)
 
-
-EARLY_RUNGS: tuple[AppleRung, ...] = (
-    AppleRung(
-        memory_gb=8,
-        asr=_nano("cpu"),
-        asr_batch_size=1,
-        asr_job_batch_size=1,
-        asr_decode_workers=1,
-        speaker_batch_size=16,
-        diarize_job_batch_size=1,
-        diarize_decode_workers=1,
-        notes=(
+# Pre-compiled recipe table. Selection is a table query, not ad-hoc branching.
+APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
+    AppleRecipe(
+        1,
+        2,
+        8,
+        _nano("cpu"),
+        1,
+        1,
+        1,
+        16,
+        1,
+        1,
+        (
             "Fun-ASR-Nano on CPU with small batches. "
             "8GB unified leaves no room for MPS copies. "
             "Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
-    AppleRung(
-        memory_gb=16,
-        asr=_nano("cpu"),
-        asr_batch_size=1,
-        asr_job_batch_size=1,
-        asr_decode_workers=2,
-        speaker_batch_size=32,
-        diarize_job_batch_size=1,
-        diarize_decode_workers=2,
-        notes=(
+    AppleRecipe(
+        1,
+        2,
+        16,
+        _nano("cpu"),
+        1,
+        1,
+        2,
+        32,
+        1,
+        2,
+        (
             "Fun-ASR-Nano on CPU. Early MPS is not assumed correct for this 800M checkpoint. "
             "Unvalidated starting point."
         ),
     ),
-    AppleRung(
-        memory_gb=32,
-        asr=_nano("mps"),
-        asr_batch_size=1,
-        asr_job_batch_size=1,
-        asr_decode_workers=2,
-        speaker_batch_size=32,
-        diarize_job_batch_size=1,
-        diarize_decode_workers=2,
-        notes=(
+    AppleRecipe(
+        1,
+        2,
+        32,
+        _nano("mps"),
+        1,
+        1,
+        2,
+        32,
+        1,
+        2,
+        (
             "Fun-ASR-Nano on MPS. 32GB is the early-chip headroom for MPS fallback copies. "
             "Speaker stays on CPU. Unvalidated starting point."
         ),
     ),
-    AppleRung(
-        memory_gb=64,
-        asr=_nano("mps"),
-        asr_batch_size=2,
-        asr_job_batch_size=1,
-        asr_decode_workers=2,
-        speaker_batch_size=64,
-        diarize_job_batch_size=1,
-        diarize_decode_workers=2,
-        notes=(
+    AppleRecipe(
+        1,
+        2,
+        64,
+        _nano("mps"),
+        2,
+        1,
+        2,
+        64,
+        1,
+        2,
+        (
             "Same Nano-on-MPS pair as the 32GB early rung, with a larger ASR batch. "
             "Unvalidated starting point."
         ),
     ),
-)
-
-MODERN_RUNGS: tuple[AppleRung, ...] = (
-    AppleRung(
-        memory_gb=8,
-        asr=_nano("cpu"),
-        asr_batch_size=1,
-        asr_job_batch_size=1,
-        asr_decode_workers=2,
-        speaker_batch_size=16,
-        diarize_job_batch_size=1,
-        diarize_decode_workers=2,
-        notes=(
+    AppleRecipe(
+        3,
+        None,
+        8,
+        _nano("cpu"),
+        1,
+        1,
+        2,
+        16,
+        1,
+        2,
+        (
             "Fun-ASR-Nano on CPU. A newer GPU does not move the 8GB rung onto MPS. "
             "Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
-    AppleRung(
-        memory_gb=16,
-        asr=_nano("mps"),
-        asr_batch_size=1,
-        asr_job_batch_size=1,
-        asr_decode_workers=2,
-        speaker_batch_size=32,
-        diarize_job_batch_size=1,
-        diarize_decode_workers=2,
-        notes=(
+    AppleRecipe(
+        3,
+        None,
+        16,
+        _nano("mps"),
+        1,
+        1,
+        2,
+        32,
+        1,
+        2,
+        (
             "Fun-ASR-Nano on MPS. Modern GPU, batch 1. Speaker and VAD stay on CPU. "
             "Unvalidated starting point."
         ),
     ),
-    AppleRung(
-        memory_gb=32,
-        asr=_nano("mps"),
-        asr_batch_size=2,
-        asr_job_batch_size=2,
-        asr_decode_workers=4,
-        speaker_batch_size=64,
-        diarize_job_batch_size=2,
-        diarize_decode_workers=2,
-        notes="Fun-ASR-Nano on MPS, batch 2. Unvalidated starting point.",
+    AppleRecipe(
+        3,
+        None,
+        32,
+        _nano("mps"),
+        2,
+        2,
+        4,
+        64,
+        2,
+        2,
+        "Fun-ASR-Nano on MPS, batch 2. Unvalidated starting point.",
     ),
-    AppleRung(
-        memory_gb=64,
-        asr=_nano("mps"),
-        asr_batch_size=4,
-        asr_job_batch_size=2,
-        asr_decode_workers=4,
-        speaker_batch_size=128,
-        diarize_job_batch_size=2,
-        diarize_decode_workers=4,
-        notes=(
+    AppleRecipe(
+        3,
+        None,
+        64,
+        _nano("mps"),
+        4,
+        2,
+        4,
+        128,
+        2,
+        4,
+        (
             "Fun-ASR-Nano on MPS, batch 4. Still one in-process diarize worker. "
             "Unvalidated starting point."
         ),
@@ -373,35 +396,72 @@ MODERN_RUNGS: tuple[AppleRung, ...] = (
 )
 
 
-def _rungs_for(generation: int) -> tuple[AppleRung, ...]:
-    if generation <= 2:
-        return EARLY_RUNGS
-    return MODERN_RUNGS
+def _recipes_for(generation: int) -> tuple[AppleRecipe, ...]:
+    rows = tuple(recipe for recipe in APPLE_RECIPE_TABLE if recipe.covers(generation))
+    if not rows:
+        raise ValueError(f"no Apple recipes cover generation {generation}")
+    return rows
 
 
-def _materialize_apple(generation: int, rung: AppleRung) -> HardwareProfile:
+def _materialize_apple(generation: int, recipe: AppleRecipe) -> HardwareProfile:
     return HardwareProfile(
-        name=f"apple-m{generation}-{rung.memory_gb}gb",
-        match=UnifiedKey(generation, rung.memory_gb),
-        examples=(f"Apple M{generation} with at least {rung.memory_gb}GB unified",),
-        asr=rung.asr,
+        name=f"apple-m{generation}-{recipe.memory_gb}gb",
+        match=UnifiedKey(generation, recipe.memory_gb),
+        examples=(f"Apple M{generation} with at least {recipe.memory_gb}GB unified",),
+        asr=recipe.asr,
         speaker=InProcessSpeaker(
             model=SPEAKER_ERES2NET_V2,
             device="cpu",
             vad_model=VAD_FSMN,
             vad_device="cpu",
-            batch_size=rung.speaker_batch_size,
+            batch_size=recipe.speaker_batch_size,
         ),
-        asr_batch_size=rung.asr_batch_size,
-        asr_job_batch_size=rung.asr_job_batch_size,
-        asr_decode_workers=rung.asr_decode_workers,
-        diarize_job_batch_size=rung.diarize_job_batch_size,
-        diarize_decode_workers=rung.diarize_decode_workers,
+        asr_batch_size=recipe.asr_batch_size,
+        asr_job_batch_size=recipe.asr_job_batch_size,
+        asr_decode_workers=recipe.asr_decode_workers,
+        diarize_job_batch_size=recipe.diarize_job_batch_size,
+        diarize_decode_workers=recipe.diarize_decode_workers,
         max_worker_shards=1,
         handler_workers=0,
         max_queued_requests=0,
-        notes=rung.notes,
+        notes=recipe.notes,
     )
+
+
+@dataclass(frozen=True)
+class _AppleColumn:
+    """Pre-compiled floor column for one generation: sorted memory → profile."""
+
+    floors: tuple[int, ...]
+    profiles: tuple[HardwareProfile, ...]
+
+    def query(self, unified_gb: float) -> HardwareProfile:
+        chosen = 0
+        for index, floor in enumerate(self.floors):
+            if floor <= unified_gb:
+                chosen = index
+            else:
+                break
+        return self.profiles[chosen]
+
+
+def _compile_apple_column(generation: int) -> _AppleColumn:
+    recipes = _recipes_for(generation)
+    floors = tuple(recipe.memory_gb for recipe in recipes)
+    if floors != tuple(sorted(floors)) or len(floors) != len(set(floors)):
+        raise RuntimeError(f"Apple memory floors for M{generation} must be strictly increasing")
+    profiles = tuple(_materialize_apple(generation, recipe) for recipe in recipes)
+    return _AppleColumn(floors, profiles)
+
+
+def query_apple_profile(generation: int, unified_gb: float) -> HardwareProfile:
+    """Table-based Apple selection: floor unified memory within the generation column."""
+    if generation < 1:
+        raise ValueError("Apple generation must be >= 1")
+    column = _APPLE_QUERY.get(generation)
+    if column is None:
+        column = _compile_apple_column(generation)
+    return column.query(unified_gb)
 
 
 def _cpu_profile() -> HardwareProfile:
@@ -613,9 +673,9 @@ def _nvidia_profiles() -> tuple[HardwareProfile, ...]:
 
 def _apple_profiles() -> tuple[HardwareProfile, ...]:
     return tuple(
-        _materialize_apple(generation, rung)
+        profile
         for generation in range(1, LISTED_APPLE_GENERATION_MAX + 1)
-        for rung in _rungs_for(generation)
+        for profile in _compile_apple_column(generation).profiles
     )
 
 
@@ -630,13 +690,13 @@ def _validate_catalog(profiles: tuple[HardwareProfile, ...]) -> None:
     names = [profile.name for profile in profiles]
     if len(names) != len(set(names)):
         raise RuntimeError("profile names must be unique")
-    for capability in (EARLY_RUNGS, MODERN_RUNGS):
-        floors = [rung.memory_gb for rung in capability]
+    for generation in (1, 3):
+        floors = [recipe.memory_gb for recipe in _recipes_for(generation)]
         if floors != sorted(floors) or len(floors) != len(set(floors)):
-            raise RuntimeError("Apple memory rungs must be strictly increasing")
-        for rung in capability:
-            if rung.asr.model != ASR_NANO:
-                raise RuntimeError("Apple rungs use Fun-ASR-Nano")
+            raise RuntimeError("Apple memory floors must be strictly increasing")
+        for recipe in _recipes_for(generation):
+            if recipe.asr.model != ASR_NANO:
+                raise RuntimeError("Apple recipes use Fun-ASR-Nano")
     nvidia = [profile for profile in profiles if isinstance(profile.match, VramKey)]
     expected = {
         "gpu-4gb": 4,
@@ -657,13 +717,13 @@ def _validate_catalog(profiles: tuple[HardwareProfile, ...]) -> None:
         if gb >= 12 and not isinstance(profile.asr, FunasrVllm):
             raise RuntimeError(f"{profile.name} stays on vLLM")
     listed_apple = {
-        f"apple-m{generation}-{rung.memory_gb}gb"
+        f"apple-m{generation}-{recipe.memory_gb}gb"
         for generation in range(1, LISTED_APPLE_GENERATION_MAX + 1)
-        for rung in _rungs_for(generation)
+        for recipe in _recipes_for(generation)
     }
     found_apple = {profile.name for profile in profiles if profile.family is Family.APPLE}
     if found_apple != listed_apple:
-        raise RuntimeError("listed Apple profiles must be the generation by rung catalog")
+        raise RuntimeError("listed Apple profiles must be the generation by floor catalog")
     for profile in profiles:
         if profile.family is Family.APPLE and profile.validated_on_host:
             raise RuntimeError(f"{profile.name} is not validated on the project host")
@@ -673,7 +733,19 @@ def _validate_catalog(profiles: tuple[HardwareProfile, ...]) -> None:
 
 _CPU_PROFILE = _cpu_profile()
 _NVIDIA_PROFILES = _nvidia_profiles()
-_LISTED = (_CPU_PROFILE, *_NVIDIA_PROFILES, *_apple_profiles())
+_APPLE_QUERY: dict[int, _AppleColumn] = {
+    generation: _compile_apple_column(generation)
+    for generation in range(1, LISTED_APPLE_GENERATION_MAX + 1)
+}
+_LISTED = (
+    _CPU_PROFILE,
+    *_NVIDIA_PROFILES,
+    *(
+        profile
+        for generation in range(1, LISTED_APPLE_GENERATION_MAX + 1)
+        for profile in _APPLE_QUERY[generation].profiles
+    ),
+)
 _validate_catalog(_LISTED)
 PROFILES: dict[str, HardwareProfile] = {profile.name: profile for profile in _LISTED}
 
@@ -698,33 +770,16 @@ def get_profile(name: str) -> HardwareProfile:
     memory = int(match.group(2))
     if generation < 1 or f"apple-m{generation}-{memory}gb" != name:
         raise _unknown_profile(name)
-    rungs = _rungs_for(generation)
-    for rung in rungs:
-        if rung.memory_gb == memory:
-            return _materialize_apple(generation, rung)
+    for recipe in _recipes_for(generation):
+        if recipe.memory_gb == memory:
+            return _materialize_apple(generation, recipe)
     if memory <= 0:
         raise _unknown_profile(name)
-    floored = select_machine(
-        Machine(
-            Family.APPLE,
-            f"Apple M{generation}",
-            apple=AppleChip(generation, float(memory), f"Apple M{generation}"),
-        )
-    )
+    floored = query_apple_profile(generation, float(memory))
     raise ValueError(
-        f"unknown profile {name!r}; {memory}GB is not an Apple memory rung, "
+        f"unknown profile {name!r}; {memory}GB is not an Apple memory floor, "
         f"{floored.name} is the floor for that chip"
     )
-
-
-def _floor_rung(rungs: tuple[AppleRung, ...], unified_gb: float) -> AppleRung:
-    chosen = rungs[0]
-    for rung in rungs:
-        if rung.memory_gb <= unified_gb:
-            chosen = rung
-        else:
-            break
-    return chosen
 
 
 def _select_nvidia(vram: Vram | None) -> HardwareProfile:
@@ -745,8 +800,7 @@ def select_machine(machine: Machine) -> HardwareProfile:
         chip = machine.apple
         if chip is None:
             raise ValueError("an Apple machine requires an Apple chip")
-        rung = _floor_rung(_rungs_for(chip.generation), chip.unified_gb)
-        return _materialize_apple(chip.generation, rung)
+        return query_apple_profile(chip.generation, chip.unified_gb)
     return _CPU_PROFILE
 
 
@@ -1055,6 +1109,7 @@ def floor_note(machine: Machine, profile: HardwareProfile) -> str:
 
 
 _IMPLICIT_COMMANDS = frozenset({"transcribe", "diarize", "speaker-service"})
+FRIENDLY_PROFILE_LEVELS = frozenset({"auto", "quality", "speed"})
 
 
 def _implicit_profile(command: str, *, platform: str | None = None) -> bool:
@@ -1068,26 +1123,172 @@ def _skips_profile(command: str, argv: Sequence[str]) -> bool:
     return command == "speaker-service" and "--check" in argv
 
 
-def extract_profile(argv: Sequence[str]) -> tuple[str | None, list[str]]:
+@dataclass(frozen=True)
+class SelectionRequest:
+    """Hardware / friendly-level selection stripped from a functional command argv."""
+
     profile: str | None = None
+    apple_generation: int | None = None
+    unified_gb: float | None = None
+    vram_gb: float | None = None
+    cpu_only: bool = False
+
+
+def extract_profile(argv: Sequence[str]) -> tuple[str | None, list[str]]:
+    """Backward-compatible helper: return only --profile and the remaining argv."""
+    request, remaining = extract_selection(argv)
+    return request.profile, remaining
+
+
+def _take_flag(
+    values: list[str],
+    index: int,
+    *,
+    flag: str,
+    cast,
+) -> tuple[object, int]:
+    value = values[index]
+    if value == flag:
+        if index + 1 >= len(values):
+            raise ValueError(f"{flag} requires a value")
+        return cast(values[index + 1]), index + 2
+    prefix = f"{flag}="
+    if value.startswith(prefix):
+        return cast(value[len(prefix) :]), index + 1
+    raise ValueError(f"internal flag parse error for {flag}")
+
+
+def extract_selection(argv: Sequence[str]) -> tuple[SelectionRequest, list[str]]:
+    profile: str | None = None
+    apple_generation: int | None = None
+    unified_gb: float | None = None
+    vram_gb: float | None = None
+    cpu_only = False
     remaining: list[str] = []
     index = 0
     values = list(argv)
     while index < len(values):
         value = values[index]
-        if value == "--profile":
-            if index + 1 >= len(values):
-                raise ValueError("--profile requires a value")
-            profile = values[index + 1]
-            index += 2
+        if value == "--profile" or value.startswith("--profile="):
+            parsed, index = _take_flag(values, index, flag="--profile", cast=str)
+            profile = str(parsed)
             continue
-        if value.startswith("--profile="):
-            profile = value.split("=", 1)[1]
+        if value == "--apple-generation" or value.startswith("--apple-generation="):
+            parsed, index = _take_flag(values, index, flag="--apple-generation", cast=int)
+            apple_generation = int(parsed)
+            continue
+        if value == "--unified-gb" or value.startswith("--unified-gb="):
+            parsed, index = _take_flag(values, index, flag="--unified-gb", cast=float)
+            unified_gb = float(parsed)
+            continue
+        if value == "--vram-gb" or value.startswith("--vram-gb="):
+            parsed, index = _take_flag(values, index, flag="--vram-gb", cast=float)
+            vram_gb = float(parsed)
+            continue
+        if value == "--cpu-only":
+            cpu_only = True
             index += 1
             continue
         remaining.append(value)
         index += 1
-    return profile, remaining
+    return (
+        SelectionRequest(
+            profile=profile,
+            apple_generation=apple_generation,
+            unified_gb=unified_gb,
+            vram_gb=vram_gb,
+            cpu_only=cpu_only,
+        ),
+        remaining,
+    )
+
+
+def _apply_friendly_level(profile: HardwareProfile, level: str) -> HardwareProfile:
+    if level == "auto":
+        return profile
+    if level == "quality":
+        if (
+            profile.family is Family.APPLE
+            and isinstance(profile.asr, FunasrAuto)
+            and profile.asr.device == "mps"
+        ):
+            return replace(
+                profile,
+                asr=replace(profile.asr, device="cpu"),
+                notes=(
+                    f"{profile.notes} quality level keeps ASR on CPU for stability."
+                ),
+            )
+        return profile
+    if level == "speed":
+        if (
+            profile.family is Family.APPLE
+            and isinstance(profile.asr, FunasrAuto)
+            and profile.asr.device == "cpu"
+            and isinstance(profile.match, UnifiedKey)
+            and profile.match.memory_gb >= 16
+        ):
+            return replace(
+                profile,
+                asr=replace(profile.asr, device="mps"),
+                notes=(
+                    f"{profile.notes} speed level prefers MPS when unified memory allows."
+                ),
+            )
+        return profile
+    raise ValueError(f"unknown friendly profile level {level!r}")
+
+
+def resolve_profile_selection(
+    request: SelectionRequest,
+    *,
+    machine: Machine | None = None,
+    platform: str | None = None,
+    detect: bool = True,
+) -> tuple[HardwareProfile, str | None]:
+    """Resolve a catalog or friendly-level profile.
+
+    Returns (profile, announcement_name). announcement_name is set when the
+    selection should print `podtrans: using profile ...` to stderr.
+    """
+    name = request.profile
+    has_hardware = (
+        request.cpu_only
+        or request.vram_gb is not None
+        or request.apple_generation is not None
+        or request.unified_gb is not None
+    )
+    concrete = name is not None and name not in FRIENDLY_PROFILE_LEVELS
+    if concrete and has_hardware:
+        raise ValueError(
+            "concrete --profile cannot be combined with "
+            "--apple-generation, --unified-gb, --vram-gb, or --cpu-only"
+        )
+    if concrete:
+        assert name is not None
+        return get_profile(name), None
+
+    level = name or "auto"
+    if level not in FRIENDLY_PROFILE_LEVELS:
+        raise ValueError(
+            f"unknown profile {level!r}; choose auto, quality, speed, or a catalog id"
+        )
+    if has_hardware:
+        chosen = machine_from_probe(
+            cpu_only=request.cpu_only,
+            vram_gb=request.vram_gb,
+            apple_generation=request.apple_generation,
+            unified_gb=request.unified_gb,
+        )
+    elif machine is not None:
+        chosen = machine
+    elif detect:
+        chosen = detect_machine(platform=platform)
+    else:
+        raise ValueError("profile selection requires hardware detection or hardware flags")
+    profile = _apply_friendly_level(select_machine(chosen), level)
+    label = profile.name if level == "auto" else f"{profile.name} ({level})"
+    return profile, label
 
 
 def resolve_command_argv(
@@ -1100,15 +1301,28 @@ def resolve_command_argv(
     args = list(argv)
     if _skips_profile(command, args):
         return args
-    name, rest = extract_profile(args)
-    if name is None and not _implicit_profile(command, platform=platform):
+    request, rest = extract_selection(args)
+    has_hardware = (
+        request.cpu_only
+        or request.vram_gb is not None
+        or request.apple_generation is not None
+        or request.unified_gb is not None
+    )
+    wants_selection = (
+        request.profile is not None
+        or has_hardware
+        or _implicit_profile(command, platform=platform)
+    )
+    if not wants_selection:
         return args
-    if name is None:
-        chosen = machine if machine is not None else detect_machine(platform=platform)
-        profile = select_machine(chosen)
-        print(f"podtrans: using profile {profile.name}", file=sys.stderr)
-    else:
-        profile = get_profile(name)
+    profile, announcement = resolve_profile_selection(
+        request,
+        machine=machine,
+        platform=platform,
+        detect=True,
+    )
+    if announcement is not None:
+        print(f"podtrans: using profile {announcement}", file=sys.stderr)
     return command_arguments(profile, command) + rest
 
 

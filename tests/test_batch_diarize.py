@@ -45,7 +45,7 @@ class BatchDiarizeTests(unittest.TestCase):
     def test_detected_apple_machine_is_announced_and_stays_in_process(self) -> None:
         stderr = io.StringIO()
         with (
-            patch("podtrans.batch_diarize.detect_machine", return_value=apple_machine()),
+            patch("podtrans.profiles.detect_machine", return_value=apple_machine()),
             patch("podtrans.diarize.main", return_value=0) as diarize_main,
             patch("podtrans.batch_diarize.subprocess.Popen") as popen,
             redirect_stderr(stderr),
@@ -62,6 +62,29 @@ class BatchDiarizeTests(unittest.TestCase):
             batch_diarize.main(["--profile", "apple-m3-8gb", "--workers", "2"])
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("exactly one in-process worker", stderr.getvalue())
+
+    def test_apple_hardware_flags_run_in_process(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("podtrans.diarize.main", return_value=0) as diarize_main,
+            patch("podtrans.batch_diarize.subprocess.Popen") as popen,
+            redirect_stderr(stderr),
+        ):
+            exit_code = batch_diarize.main(
+                [
+                    "--apple-generation",
+                    "4",
+                    "--unified-gb",
+                    "24",
+                    "--",
+                    "--limit",
+                    "1",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        popen.assert_not_called()
+        diarize_main.assert_called_once()
+        self.assertIn("podtrans: using profile apple-m4-16gb", stderr.getvalue())
 
 
 if __name__ == "__main__":

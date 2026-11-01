@@ -85,8 +85,6 @@ podtrans transcribe
 podtrans diarize
 podtrans diarize-batch
 podtrans speaker-service
-podtrans profiles
-podtrans recommend
 podtrans validate-archive
 podtrans validate-diarization
 podtrans benchmark-workers
@@ -106,31 +104,35 @@ podtrans help diarize
 export PODTRANS_DATA_DIR=/path/to/podcast-data
 ```
 
-## 硬件推荐
+## 硬件档位
 
-列出所有内置档位：
-
-```bash
-podtrans profiles
-podtrans profiles --json
-```
-
-`podtrans recommend` 读取本机硬件。NVIDIA GPU 按显存选择档位。Apple Silicon 按芯片代际和统一内存选择档位。其他机器使用 CPU。
+在功能命令上直接选择硬件，不再提供独立的 `profiles` / `recommend` 子命令。
 
 ```bash
-podtrans recommend
-podtrans recommend --vram-gb 16 --cpu-cores 12
-podtrans recommend --cpu-only --cpu-cores 16
-podtrans recommend --apple-generation 4 --unified-gb 24
+podtrans transcribe --apple-generation 4 --unified-gb 24
+podtrans transcribe --profile auto
+podtrans transcribe --profile quality
+podtrans transcribe --profile speed
+podtrans diarize --vram-gb 16
+podtrans diarize-batch --cpu-only
 ```
 
-在 macOS 上，`transcribe`、`diarize` 和 `speaker-service` 省略 `--profile` 时会选用检测到的档位。程序把档位名写到标准错误，例如 `podtrans: using profile apple-m4-16gb`。写在后面的参数覆盖档位里的同名参数。Linux 上省略 `--profile` 时，这三个命令保持各自的默认参数。`diarize-batch` 在每个系统上都会选择一个档位。Rosetta（x86_64）进程不会被检测为 Apple 档位，而是使用 `cpu`。
+`--profile` 接受友好档位或具体目录 id：
 
-Apple 档位的名称是 `apple-m{代}-{档}gb`。`podtrans profiles` 列出 M1 到 M5。更新的芯片在被写进这张表之前，仍然按同一规则解析，例如 `apple-m6-16gb`。代际 1 和 2 共用一套批次。代际 3 及以后共用另一套。统一内存按 8、16、32、64GB 向下取整。24GB 的 M4 得到 `apple-m4-16gb`。低于 8GB 的 Apple 芯片使用该代的 8GB 档。
+| 值 | 含义 |
+| --- | --- |
+| `auto` | 按检测到的硬件（或同时给出的硬件旗标）查询目录档位 |
+| `quality` | 同 `auto`，但 Apple 上将 ASR 留在 CPU 以提高稳定性 |
+| `speed` | 同 `auto`，但在统一内存 ≥16GB 时偏好 MPS |
+| `cpu` / `gpu-*` / `apple-m*-*gb` | 固定目录档位 |
 
-`--apple-generation` 和 `--unified-gb` 必须一起给出，并且不能和 `--vram-gb` 或 `--cpu-only` 同时使用。
+`--apple-generation` 与 `--unified-gb` 必须一起给出，且不能与 `--vram-gb`、`--cpu-only` 或具体目录 `--profile` 混用。
 
-所有 Apple 档位都使用 Fun-ASR-Nano。M1 和 M2 在 16GB 及以下把 ASR 放在 CPU 上，32GB 及以上使用 MPS。M3 及更新的芯片从 16GB 起使用 MPS，8GB 仍在 CPU 上。说话人模型和 VAD 留在 CPU 上。标注在当前进程完成，不启动 `speaker-service`。这些档位还没有在项目机器上跑过。具体批次以 `podtrans profiles` 为准。
+在 macOS 上，`transcribe`、`diarize` 和 `speaker-service` 在省略 `--profile` 与硬件旗标时会自动选用检测到的档位，并把名称写到标准错误，例如 `podtrans: using profile apple-m4-16gb`。写在后面的参数覆盖档位里的同名参数。Linux 上省略选择旗标时，这三个命令保持各自的默认参数；传入 `--profile auto` 或硬件旗标时才会选择。`diarize-batch` 在每个系统上都会选择一个档位。Rosetta（x86_64）进程不会被检测为 Apple 档位，而是使用 `cpu`。
+
+Apple 档位的名称是 `apple-m{代}-{档}gb`。内置表覆盖 M1 到 M5；更新的芯片在被写进列表之前，仍然按同一张预编译表查询，例如 `apple-m6-16gb`。代际 1 和 2 共用一套批次；代际 3 及以后共用另一套。统一内存按 8、16、32、64GB 向下取整。24GB 的 M4 得到 `apple-m4-16gb`。低于 8GB 的 Apple 芯片使用该代的 8GB 档。M5 Pro 64GB 得到 `apple-m5-64gb`。
+
+所有 Apple 档位都使用 Fun-ASR-Nano。M1 和 M2 在 16GB 及以下把 ASR 放在 CPU 上，32GB 及以上使用 MPS。M3 及更新的芯片从 16GB 起使用 MPS，8GB 仍在 CPU 上。说话人模型和 VAD 留在 CPU 上。标注在当前进程完成，不启动 `speaker-service`。这些档位还没有在项目机器上跑过。
 
 固定档位，或只改一个参数：
 
@@ -169,7 +171,7 @@ GPU 档位使用 `min(profile 最大 worker, CPU 核心数 // 4)`，并继续限
 
 NVIDIA CUDA 是当前验证路径。AMD RX 7600 8GB、7700 XT 12GB、7800 XT/7900 GRE 16GB、7900 XT 20GB、7900 XTX 24GB 可按同显存档位作为参数起点，但需要兼容的 ROCm PyTorch/FunASR/vLLM 环境；无法满足运行时兼容性时应使用 `cpu`。
 
-`gpu-48gb` 来自项目实际节点验证。其他 NVIDIA 档位和全部 Apple 档位按显存、统一内存和 CPU 核数保守缩放，应先用少量节目验证，再根据峰值显存、GPU 利用率和 CPU 特征提取速度提高参数。`profiles --json` 里只有 `gpu-48gb` 的 `validated_on_host` 为 true。
+`gpu-48gb` 来自项目实际节点验证。其他 NVIDIA 档位和全部 Apple 档位按显存、统一内存和 CPU 核数保守缩放，应先用少量节目验证，再根据峰值显存、GPU 利用率和 CPU 特征提取速度提高参数。目录里只有 `gpu-48gb` 的 `validated_on_host` 为 true。
 
 ## 准备配置
 
@@ -204,14 +206,15 @@ CPU：
 podtrans transcribe --profile cpu
 ```
 
-自动推荐配置：
+按硬件旗标或友好档位选择：
 
 ```bash
-profile="$(podtrans recommend --name-only)"
-podtrans transcribe --profile "${profile}"
+podtrans transcribe --apple-generation 4 --unified-gb 24
+podtrans transcribe --profile auto
+podtrans transcribe --profile speed
 ```
 
-在 Apple Silicon 上也可以直接运行 `podtrans transcribe`。命令会套用检测到的档位，并把 `podtrans: using profile <name>` 写到标准错误。后面的参数仍然优先。Linux 上省略 `--profile` 时，本命令保持自己的默认值。
+在 Apple Silicon 上也可以直接运行 `podtrans transcribe`。命令会套用检测到的档位，并把 `podtrans: using profile <name>` 写到标准错误。后面的参数仍然优先。Linux 上省略选择旗标时，本命令保持自己的默认值。
 
 指定 24GB 档位，并覆盖一个预设参数：
 
@@ -292,7 +295,6 @@ podtrans diarize \
 uv lock --check
 uv sync
 uv run python -m unittest discover -s tests -v
-uv run podtrans profiles
 uv build
 ```
 

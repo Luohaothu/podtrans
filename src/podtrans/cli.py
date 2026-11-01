@@ -2,24 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
-import os
 import sys
 from collections.abc import Callable
 
 from . import __version__
-from .profiles import (
-    Family,
-    Machine,
-    floor_note,
-    listed_profiles,
-    machine_from_probe,
-    profile_json,
-    resolve_command_argv,
-    resolved_profile,
-    select_machine,
-)
+from .profiles import resolve_command_argv
 
 
 Command = tuple[str, str]
@@ -62,10 +50,6 @@ Core commands:
   diarize-batch           Run concurrent diarization with one GPU model service
   speaker-service         Run or check the shared GPU embedding service
 
-Configuration:
-  profiles                List built-in hardware profiles
-  recommend               Detect hardware and recommend a profile
-
 Validation and benchmarks:
   validate-archive
   validate-diarization
@@ -73,94 +57,17 @@ Validation and benchmarks:
   benchmark-fbank
 
 Use `podtrans <command> --help` for command-specific options.
-Profile-aware commands accept `--profile NAME`; later options override it.
-On Apple Silicon, transcribe, diarize, and speaker-service select a profile when `--profile` is omitted.
-Linux commands without `--profile` keep their own defaults.
-diarize-batch always selects a profile. Apple and CPU profiles diarize in-process.
+Functional commands accept hardware selection flags and `--profile`:
+  --profile auto|quality|speed|<catalog-id>
+  --apple-generation N --unified-gb GB
+  --vram-gb GB | --cpu-only
+Later options override profile defaults.
+On Apple Silicon, transcribe, diarize, and speaker-service select a profile when
+`--profile` and hardware flags are omitted. Linux keeps command defaults unless
+selection flags are provided. diarize-batch always selects a profile.
+Apple and CPU profiles diarize in-process.
 """
     )
-
-
-def profiles_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="podtrans profiles")
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--cpu-cores", type=int)
-    args = parser.parse_args(argv)
-    if args.cpu_cores is not None and args.cpu_cores <= 0:
-        parser.error("--cpu-cores must be positive")
-    if args.json:
-        import json
-
-        payload = [
-            resolved_profile(profile, cpu_cores=args.cpu_cores)
-            for profile in listed_profiles()
-        ]
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
-    print(
-        f"{'PROFILE':<16} {'FAMILY':<8} {'MEMORY':<14} "
-        f"{'ASR_PAIR':<30} {'SPK_BATCH':<10} MODE"
-    )
-    for profile in listed_profiles():
-        print(
-            f"{profile.name:<16} {profile.family.value:<8} "
-            f"{profile.memory_label():<14} {profile.asr_pair_label():<30} "
-            f"{profile.speaker.batch_size:<10} {profile.mode_label()}"
-        )
-    return 0
-
-
-def _hardware_line(machine: Machine, cpu_cores: int | None) -> str:
-    if machine.family is Family.NVIDIA and machine.vram is not None:
-        return f"{machine.label} ({machine.vram.gb:.1f}GB)"
-    if machine.family is Family.APPLE and machine.apple is not None:
-        return f"{machine.label} ({machine.apple.unified_gb:.1f}GB unified)"
-    cores = cpu_cores or os.cpu_count() or 1
-    return f"CPU ({cores} cores)"
-
-
-def recommend_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="podtrans recommend")
-    parser.add_argument("--vram-gb", type=float)
-    parser.add_argument("--cpu-only", action="store_true")
-    parser.add_argument("--apple-generation", type=int)
-    parser.add_argument("--unified-gb", type=float)
-    parser.add_argument("--cpu-cores", type=int)
-    output = parser.add_mutually_exclusive_group()
-    output.add_argument("--json", action="store_true")
-    output.add_argument("--name-only", action="store_true")
-    args = parser.parse_args(argv)
-    if args.cpu_cores is not None and args.cpu_cores <= 0:
-        parser.error("--cpu-cores must be positive")
-    try:
-        machine = machine_from_probe(
-            cpu_only=args.cpu_only,
-            vram_gb=args.vram_gb,
-            apple_generation=args.apple_generation,
-            unified_gb=args.unified_gb,
-        )
-    except ValueError as exc:
-        parser.error(str(exc))
-    profile = select_machine(machine)
-    if args.name_only:
-        print(profile.name)
-        return 0
-    if args.json:
-        print(profile_json(profile, cpu_cores=args.cpu_cores))
-        return 0
-
-    config = resolved_profile(profile, cpu_cores=args.cpu_cores)
-    print(f"hardware: {_hardware_line(machine, args.cpu_cores)}")
-    print(f"profile: {profile.name}")
-    print(f"notes: {floor_note(machine, profile)}")
-    print()
-    print(f"podtrans transcribe --profile {profile.name}")
-    if profile.uses_speaker_service:
-        print(f"podtrans diarize-batch --profile {profile.name}")
-        print(f"recommended worker shards: {config['worker_shards']}")
-    else:
-        print(f"podtrans diarize --profile {profile.name}")
-    return 0
 
 
 def load_command(command: str) -> Callable[[list[str]], int]:
@@ -193,10 +100,6 @@ def main(argv: list[str] | None = None) -> int:
 
     command, command_args = args[0], args[1:]
     try:
-        if command == "profiles":
-            return profiles_main(command_args)
-        if command == "recommend":
-            return recommend_main(command_args)
         if command not in COMMANDS:
             raise ValueError(f"unknown command {command!r}")
         if command in PROFILE_AWARE_COMMANDS:
