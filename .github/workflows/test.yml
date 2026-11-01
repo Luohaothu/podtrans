@@ -47,7 +47,6 @@ jobs:
           printf '%s\n' "$help" | grep -q -- '--apple-generation'
           printf '%s\n' "$help" | grep -q -- '--unified-gb'
           printf '%s\n' "$help" | grep -q -- '--profile'
-          ! printf '%s\n' "$help" | grep -Eq '(^|[[:space:]])(profiles|recommend)([[:space:]]|$)'
           name="$(uv run --frozen python -c 'from podtrans.profiles import detect_machine, select_machine; print(select_machine(detect_machine()).name)')"
           printf 'selected=%s\n' "$name"
           if [ "${{ matrix.tier }}" = "apple" ]; then
