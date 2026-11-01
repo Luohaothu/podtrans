@@ -14,6 +14,7 @@
 ## 安装
 
 支持 Python 3.11 和 3.12。
+只支持 Linux 和 macOS。
 
 ### uv
 
