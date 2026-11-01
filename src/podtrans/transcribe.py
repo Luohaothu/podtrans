@@ -525,7 +525,6 @@ def main(argv: list[str]) -> int:
         raise ValueError("--job-batch-size must be positive")
     spec = parse_asr_spec(args)
     session = open_asr(spec)
-    session.prepare()
 
     channel_filter = set(args.channel) if args.channel else None
     episode_dir_filter = {Path(path).resolve() for path in args.episode_dir} if args.episode_dir else None
@@ -548,6 +547,7 @@ def main(argv: list[str]) -> int:
         write_report(jobs_total=0, skipped=skipped, processed=0, ok=0, errors=0)
         return verify_only()
 
+    session.prepare()
     ffmpeg = find_ffmpeg()
     log(f"[transcribe] ffmpeg={ffmpeg}")
 

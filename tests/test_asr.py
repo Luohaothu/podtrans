@@ -691,7 +691,7 @@ class RedirectAndPrepareTests(unittest.TestCase):
         )
         self.assertIsNone(remote.prepare())
 
-    def test_transcribe_main_prepares_before_selecting_jobs(self) -> None:
+    def test_transcribe_main_skips_prepare_when_no_jobs(self) -> None:
         order: list[str] = []
 
         class FakeSession:
@@ -720,7 +720,49 @@ class RedirectAndPrepareTests(unittest.TestCase):
 
             code = transcribe_main([])
         self.assertEqual(code, 0)
-        self.assertEqual(order, ["prepare", "load_jobs"])
+        self.assertEqual(order, ["load_jobs"])
+
+    def test_transcribe_main_prepares_before_conversion_when_jobs_exist(self) -> None:
+        order: list[str] = []
+        job = Job(
+            channel="c",
+            number="1",
+            title="t",
+            episode_dir=Path("."),
+            audio_path=Path("audio"),
+            transcript_json=Path("transcript.json"),
+            transcript_txt=Path("transcript.txt"),
+            transcript_md=Path("transcript.md"),
+        )
+
+        class FakeSession:
+            source = AsrSource(model="m", backend="auto_model", device="cpu")
+            batch_size = 1
+
+            def prepare(self) -> None:
+                order.append("prepare")
+
+            def transcribe(self, paths: list[str]) -> list[dict[str, object]]:
+                return [{"text": "x", "timestamps": []}]
+
+        with (
+            patch("podtrans.transcribe.parse_asr_spec", return_value=object()),
+            patch("podtrans.transcribe.open_asr", return_value=FakeSession()),
+            patch(
+                "podtrans.transcribe.load_jobs",
+                side_effect=lambda **kwargs: order.append("load_jobs") or ([job], []),
+            ),
+            patch(
+                "podtrans.transcribe.find_ffmpeg",
+                side_effect=lambda: order.append("ffmpeg") or (_ for _ in ()).throw(RuntimeError("stop")),
+            ),
+            patch("podtrans.transcribe.log"),
+        ):
+            from podtrans.transcribe import main as transcribe_main
+
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                transcribe_main([])
+        self.assertEqual(order, ["load_jobs", "prepare", "ffmpeg"])
 
 
 class TranscribeBoundaryTests(unittest.TestCase):
