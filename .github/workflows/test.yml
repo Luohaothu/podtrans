@@ -40,17 +40,16 @@ jobs:
         run: uv run --frozen python -m unittest discover -s tests -v
       - name: Smoke test installed CLI
         run: uv run --frozen podtrans --version
-      - name: Assert recommended profile
+      - name: Assert detected profile on functional selection
         shell: bash
         run: |
-          help="$(uv run --frozen podtrans recommend --help)"
-          name="$(uv run --frozen podtrans recommend --name-only)"
-          if printf '%s\n' "$help" | grep -q -- '--apple-generation'; then
-            if [ "${{ matrix.tier }}" = "apple" ]; then
-              printf '%s\n' "$name" | grep -Eq '^apple-m[0-9]+-[0-9]+gb$'
-            else
-              [ "$name" = "cpu" ]
-            fi
+          help="$(uv run --frozen podtrans transcribe --help)"
+          printf '%s\n' "$help" | grep -q -- '--apple-generation'
+          printf '%s\n' "$help" | grep -q -- '--unified-gb'
+          printf '%s\n' "$help" | grep -q -- '--profile'
+          name="$(uv run --frozen python -c 'from podtrans.profiles import detect_machine, select_machine; print(select_machine(detect_machine()).name)')"
+          if [ "${{ matrix.tier }}" = "apple" ]; then
+            printf '%s\n' "$name" | grep -Eq '^apple-m[0-9]+-[0-9]+gb$'
           else
             [ "$name" = "cpu" ]
           fi
@@ -65,4 +64,5 @@ jobs:
             --python /tmp/podtrans-wheel-test/bin/python \
             --no-deps \
             dist/podtrans-0.2.0-py3-none-any.whl
-          /tmp/podtrans-wheel-test/bin/podtrans profiles --cpu-cores 8
+          /tmp/podtrans-wheel-test/bin/podtrans --version
+          /tmp/podtrans-wheel-test/bin/podtrans transcribe --help | grep -q -- '--apple-generation'
