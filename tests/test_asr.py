@@ -19,6 +19,7 @@ from podtrans.asr import (
     AutoModelAsr,
     RemoteAsr,
     VllmAsr,
+    _NoRedirectHandler,
     _parse_transcription_payload,
     open_asr,
     parse_asr_spec,
@@ -175,6 +176,17 @@ class TranscriptionPayloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_transcription_payload({"words": [{"word": "hi", "start": 0, "end": 1}]})
 
+    def test_non_finite_timestamps_are_rejected(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "not finite"):
+                    _parse_transcription_payload(
+                        {
+                            "text": "hi",
+                            "words": [{"word": "hi", "start": 0.0, "end": value}],
+                        }
+                    )
+
 
 class ParseAsrSpecTests(unittest.TestCase):
     def test_unset_flags_build_auto_model_with_historical_defaults(self) -> None:
@@ -324,6 +336,31 @@ class ParseAsrSpecTests(unittest.TestCase):
         assert isinstance(missing, RemoteAsr)
         self.assertIsNone(missing.api_key)
 
+    def test_api_key_requires_https_or_loopback_http(self) -> None:
+        with patch.dict("os.environ", {"PODTRANS_ASR_API_KEY": "sk-secret"}):
+            with self.assertRaisesRegex(ValueError, "https --asr-url"):
+                parse_asr_spec(
+                    spec_args(asr_url="http://example.com/v1", model="whisper")
+                )
+            https_spec = parse_asr_spec(
+                spec_args(asr_url="https://api.openai.com/v1", model="whisper")
+            )
+            loopback_spec = parse_asr_spec(spec_args(asr_url=URL, model="whisper"))
+            localhost_spec = parse_asr_spec(
+                spec_args(asr_url="http://localhost:8000/v1", model="whisper")
+            )
+        assert isinstance(https_spec, RemoteAsr)
+        assert isinstance(loopback_spec, RemoteAsr)
+        assert isinstance(localhost_spec, RemoteAsr)
+        self.assertEqual(https_spec.api_key, "sk-secret")
+        with patch.dict("os.environ"):
+            os.environ.pop("PODTRANS_ASR_API_KEY", None)
+            plain = parse_asr_spec(
+                spec_args(asr_url="http://example.com/v1", model="whisper")
+            )
+        assert isinstance(plain, RemoteAsr)
+        self.assertIsNone(plain.api_key)
+
     def test_non_positive_batch_size_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "--batch-size"):
             parse_asr_spec(spec_args(batch_size=0))
@@ -349,7 +386,7 @@ class RemoteSessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             wav_path = Path(temp_dir) / "chunk.wav"
             wav_path.write_bytes(b"RIFFwav")
-            with patch("urllib.request.urlopen", urlopen):
+            with patch("podtrans.asr._open", urlopen):
                 result = session.transcribe([str(wav_path)])
         self.assertNotIn("funasr", sys.modules)
         self.assertEqual(result[0]["timestamps"][0]["token"], "hi")
@@ -373,7 +410,7 @@ class RemoteSessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             wav_path = Path(temp_dir) / "a.wav"
             wav_path.write_bytes(b"wav")
-            with patch("urllib.request.urlopen", urlopen):
+            with patch("podtrans.asr._open", urlopen):
                 result = open_asr(spec).transcribe([str(wav_path)])
         self.assertEqual(result, [{"text": "hi", "timestamps": []}])
         self.assertEqual(requests[0].get_header("Authorization"), "Bearer sk-local")
@@ -394,7 +431,7 @@ class RemoteSessionTests(unittest.TestCase):
             second = Path(temp_dir) / "b.wav"
             first.write_bytes(b"a")
             second.write_bytes(b"b")
-            with patch("urllib.request.urlopen", urlopen):
+            with patch("podtrans.asr._open", urlopen):
                 result = open_asr(spec).transcribe([str(first), str(second)])
         self.assertEqual([item["text"] for item in result], ["a.wav", "b.wav"])
 
@@ -411,7 +448,7 @@ class RemoteSessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             wav_path = Path(temp_dir) / "a.wav"
             wav_path.write_bytes(b"wav")
-            with patch("urllib.request.urlopen", urlopen):
+            with patch("podtrans.asr._open", urlopen):
                 result = open_asr(spec).transcribe([str(wav_path)])
         self.assertEqual(result, [{"text": "only text", "timestamps": []}])
         self.assertIn(b"verbose_json", requests[0].data)
@@ -434,7 +471,7 @@ class RemoteSessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             wav_path = Path(temp_dir) / "a.wav"
             wav_path.write_bytes(b"wav")
-            with patch("urllib.request.urlopen", urlopen):
+            with patch("podtrans.asr._open", urlopen):
                 with self.assertRaises(RuntimeError) as raised:
                     open_asr(spec).transcribe([str(wav_path)])
         self.assertEqual(calls, 1)
@@ -460,7 +497,7 @@ class RemoteSessionTests(unittest.TestCase):
             ok_path.write_bytes(b"ok")
             bad_path.write_bytes(b"bad")
             with (
-                patch("urllib.request.urlopen", urlopen),
+                patch("podtrans.asr._open", urlopen),
                 patch("podtrans.asr.time.sleep"),
             ):
                 with self.assertRaises(RuntimeError):
@@ -483,7 +520,7 @@ class RemoteSessionTests(unittest.TestCase):
             wav_path = Path(temp_dir) / "a.wav"
             wav_path.write_bytes(b"wav")
             with (
-                patch("urllib.request.urlopen", urlopen),
+                patch("podtrans.asr._open", urlopen),
                 patch("podtrans.asr.time.sleep"),
             ):
                 result = open_asr(spec).transcribe([str(wav_path)])
@@ -597,6 +634,95 @@ class LocalSessionTests(unittest.TestCase):
         self.assertIs(constructed[0]["enforce_eager"], False)
 
 
+class RedirectAndPrepareTests(unittest.TestCase):
+    def test_redirect_handler_refuses_to_follow(self) -> None:
+        handler = _NoRedirectHandler()
+        self.assertIsNone(
+            handler.redirect_request(
+                None,
+                None,
+                302,
+                "Found",
+                EmailMessage(),
+                "https://evil.example/v1/audio/transcriptions",
+            )
+        )
+
+    def test_post_once_uses_no_redirect_open_helper(self) -> None:
+        spec = parse_asr_spec(spec_args(asr_url=URL, model="whisper"))
+        session = open_asr(spec)
+        opened = []
+
+        def fake_open(request, *, timeout):
+            opened.append((request.full_url, timeout, request.get_header("Authorization")))
+            raise http_error(302, b"redirect")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wav_path = Path(temp_dir) / "a.wav"
+            wav_path.write_bytes(b"wav")
+            with patch("podtrans.asr._open", fake_open):
+                with self.assertRaises(RuntimeError) as raised:
+                    session.transcribe([str(wav_path)])
+        self.assertEqual(opened[0][0], TRANSCRIPTION_URL)
+        self.assertEqual(opened[0][1], 600.0)
+        self.assertIn("302", str(raised.exception))
+
+    def test_local_prepare_loads_model_and_remote_prepare_is_noop(self) -> None:
+        constructed: list[dict[str, object]] = []
+
+        class FakeAutoModel:
+            def __init__(self, **kwargs: object) -> None:
+                constructed.append(kwargs)
+
+            def generate(self, input: object, **kwargs: object) -> dict[str, str]:
+                return {"text": "ok"}
+
+        fake = ModuleType("funasr")
+        fake.AutoModel = FakeAutoModel
+        local = open_asr(parse_asr_spec(spec_args(model="m", device="cpu")))
+        remote = open_asr(parse_asr_spec(spec_args(asr_url=URL, model="whisper")))
+        with patch.dict(sys.modules, {"funasr": fake}):
+            local.prepare()
+            local.prepare()
+        remote.prepare()
+        self.assertEqual(
+            constructed,
+            [{"model": "m", "device": "cpu", "disable_update": True}],
+        )
+        self.assertIsNone(remote.prepare())
+
+    def test_transcribe_main_prepares_before_selecting_jobs(self) -> None:
+        order: list[str] = []
+
+        class FakeSession:
+            source = AsrSource(model="m", backend="auto_model", device="cpu")
+            batch_size = 1
+
+            def prepare(self) -> None:
+                order.append("prepare")
+
+            def transcribe(self, paths: list[str]) -> list[dict[str, object]]:
+                order.append("transcribe")
+                return [{"text": "x", "timestamps": []}]
+
+        with (
+            patch("podtrans.transcribe.parse_asr_spec", return_value=object()),
+            patch("podtrans.transcribe.open_asr", return_value=FakeSession()),
+            patch(
+                "podtrans.transcribe.load_jobs",
+                side_effect=lambda **kwargs: order.append("load_jobs") or ([], []),
+            ),
+            patch("podtrans.transcribe.write_report"),
+            patch("podtrans.transcribe.verify_only", return_value=0),
+            patch("podtrans.transcribe.log"),
+        ):
+            from podtrans.transcribe import main as transcribe_main
+
+            code = transcribe_main([])
+        self.assertEqual(code, 0)
+        self.assertEqual(order, ["prepare", "load_jobs"])
+
+
 class TranscribeBoundaryTests(unittest.TestCase):
     def test_parser_flags_belong_to_one_class_and_in_process_defaults_are_unset(self) -> None:
         parser = build_parser()
@@ -637,6 +763,9 @@ class TranscribeBoundaryTests(unittest.TestCase):
         class Session:
             source = AsrSource(model="m", backend="openai", device="remote", endpoint=URL)
             batch_size = 2
+
+            def prepare(self) -> None:
+                return None
 
             def transcribe(self, paths: list[str]) -> list[dict[str, object]]:
                 calls.append(list(paths))

@@ -137,6 +137,37 @@ class BatchDiarizeTests(unittest.TestCase):
                 popen.assert_not_called()
             self.assertEqual(socket_path.read_bytes(), b"live")
 
+    def test_spawn_cleans_up_on_keyboard_interrupt_while_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "speaker.sock"
+            process = Mock()
+            process.poll.return_value = None
+            process.wait.return_value = 0
+            with (
+                _PreservedServiceLog(),
+                patch(
+                    "podtrans.speaker_service.request",
+                    side_effect=ConnectionRefusedError("down"),
+                ),
+                patch(
+                    "podtrans.batch_diarize.subprocess.Popen",
+                    return_value=process,
+                ),
+                patch(
+                    "podtrans.batch_diarize._wait_until_ready",
+                    side_effect=KeyboardInterrupt(),
+                ),
+                patch.object(batch_diarize, "stop_process") as stop_process,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    batch_diarize.spawn_speaker_service(
+                        socket_path,
+                        get_profile("gpu-8gb"),
+                        5,
+                    )
+            stop_process.assert_called_once_with(process)
+            self.assertFalse(socket_path.exists())
+
     def test_spawn_replaces_a_stale_socket_and_closes_the_child_if_startup_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             socket_path = Path(temp_dir) / "speaker.sock"

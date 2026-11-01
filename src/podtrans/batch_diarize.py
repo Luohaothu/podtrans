@@ -195,12 +195,12 @@ def spawn_speaker_service(
             stderr=subprocess.STDOUT,
             text=True,
         )
-    except Exception:
+    except BaseException:
         log_handle.close()
         raise
     try:
         _wait_until_ready(socket, timeout_seconds, process)
-    except Exception:
+    except BaseException:
         stop_process(process)
         socket.unlink(missing_ok=True)
         log_handle.close()

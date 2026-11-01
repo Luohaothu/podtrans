@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import math
 import os
 import secrets
 import time
@@ -135,6 +137,10 @@ class AsrSession(Protocol):
     source: AsrSource
     batch_size: int
 
+    def prepare(self) -> None:
+        """Load local models before any job work. Remote sessions are a no-op."""
+        raise NotImplementedError
+
     def transcribe(self, wav_paths: Sequence[str]) -> list[dict[str, Any]]:
         """Return one dict per path, in the same order.
 
@@ -166,6 +172,10 @@ def parse_asr_spec(args: Any) -> AsrSpec:
             api_key = None
         if api_key is not None and any(char in api_key for char in "\r\n"):
             raise ValueError("PODTRANS_ASR_API_KEY must not contain a newline")
+        if api_key is not None and not _key_transport_is_safe(base_url):
+            raise ValueError(
+                "PODTRANS_ASR_API_KEY requires an https --asr-url unless the host is loopback"
+            )
         return RemoteAsr(
             base_url=base_url,
             model=model.strip(),
@@ -316,7 +326,10 @@ def _pick_time(item: dict[str, Any], *keys: str) -> float:
 def _finite_number(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("transcription timestamp is not a number")
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("transcription timestamp is not finite")
+    return number
 
 
 def _require_positive_int(value: Any, flag: str) -> int:
@@ -351,6 +364,33 @@ def _url_with_path(parsed: urllib.parse.ParseResult, path: str) -> str:
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
+def _key_transport_is_safe(base_url: str) -> bool:
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http" or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _open(request: urllib.request.Request, *, timeout: float):
+    return _OPENER.open(request, timeout=timeout)
+
+
 class _RemoteAsrSession:
     def __init__(self, spec: RemoteAsr) -> None:
         self.source = AsrSource(
@@ -361,6 +401,9 @@ class _RemoteAsrSession:
         )
         self.batch_size = spec.batch_size
         self._spec = spec
+
+    def prepare(self) -> None:
+        return None
 
     def transcribe(self, wav_paths: Sequence[str]) -> list[dict[str, Any]]:
         paths = [str(path) for path in wav_paths]
@@ -462,7 +505,7 @@ class _RemoteAsrSession:
         if self._spec.api_key is not None:
             request.add_header("Authorization", f"Bearer {self._spec.api_key}")
         try:
-            with urllib.request.urlopen(request, timeout=self._spec.timeout_seconds) as response:
+            with _open(request, timeout=self._spec.timeout_seconds) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             if exc.code == 400 and fallback_on_400:
@@ -483,6 +526,9 @@ class _LocalAsrSession:
             endpoint=None,
         )
         self._model: Any = None
+
+    def prepare(self) -> None:
+        self._ensure_model()
 
     def transcribe(self, wav_paths: Sequence[str]) -> list[dict[str, Any]]:
         paths = [str(path) for path in wav_paths]
