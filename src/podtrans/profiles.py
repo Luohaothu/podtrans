@@ -206,7 +206,7 @@ class HardwareProfile:
         if isinstance(self.match, VramKey):
             if not isinstance(self.speaker, SpeakerService):
                 raise ValueError("NVIDIA profiles use speaker-service")
-            if self.asr.device != "cuda":
+            if not isinstance(self.asr, FunasrAuto | FunasrVllm) or self.asr.device != "cuda":
                 raise ValueError("NVIDIA ASR must run on CUDA")
         elif isinstance(self.match, UnifiedKey):
             cpu_auto = isinstance(self.asr, FunasrAuto) and self.asr.device == "cpu"
