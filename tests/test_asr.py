@@ -819,6 +819,55 @@ class MlxSessionTests(unittest.TestCase):
             self.assertEqual(session.transcribe([]), [])
 
 
+class MlxChunkBoundTests(unittest.TestCase):
+    def test_long_audio_chunks_stay_under_frontend_max_seconds(self) -> None:
+        from podtrans.transcribe import (
+            chunk_seconds_within_frontend,
+            read_mlx_frontend_max_seconds,
+        )
+
+        class FbankConfig:
+            def __init__(self) -> None:
+                self.max_seconds = 30.0
+
+        class _FunasrPackage(ModuleType):
+            __path__: list[str]
+
+        class _FrontendModule(ModuleType):
+            FbankConfig: type
+
+        package = _FunasrPackage("funasr_mlx")
+        package.__path__ = []
+        frontend = _FrontendModule("funasr_mlx.frontend")
+        frontend.FbankConfig = FbankConfig
+        with patch.dict(
+            sys.modules,
+            {"funasr_mlx": package, "funasr_mlx.frontend": frontend},
+        ):
+            max_seconds = read_mlx_frontend_max_seconds()
+        self.assertEqual(max_seconds, 30.0)
+        chosen = chunk_seconds_within_frontend(30, max_seconds)
+        self.assertLess(chosen, max_seconds)
+        self.assertEqual(chunk_seconds_within_frontend(10, max_seconds), 10)
+
+        # ffmpeg -segment_time 30 on 16 kHz PCM emitted 481280 frames (30.08 s).
+        # The frontend rejects len(samples) > int(fs * max_seconds).
+        fs = 16000
+        overhang_frames = 1280
+        sample_limit = int(fs * max_seconds)
+        total = 156
+        pieces: list[int] = []
+        remaining = total
+        while remaining > 0:
+            piece = min(chosen, remaining)
+            pieces.append(piece)
+            remaining -= piece
+        self.assertGreater(sum(pieces), max_seconds)
+        for piece in pieces:
+            frames = piece * fs + overhang_frames
+            self.assertLessEqual(frames, sample_limit)
+
+
 class RedirectAndPrepareTests(unittest.TestCase):
     def test_redirect_handler_refuses_to_follow(self) -> None:
         handler = _NoRedirectHandler()
