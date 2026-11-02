@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from email.message import EmailMessage
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -30,6 +31,21 @@ from podtrans.transcribe import ROOT, ChunkTask, Job, build_parser, transcribe_c
 
 URL = "http://127.0.0.1:8000/v1"
 TRANSCRIPTION_URL = "http://127.0.0.1:8000/v1/audio/transcriptions"
+
+
+class _MlxApiModule(ModuleType):
+    download_model: Callable[..., Path]
+    TranscribeWorker: type
+
+
+def _mlx_modules(
+    download_model: Callable[..., Path],
+    worker: type,
+) -> dict[str, ModuleType]:
+    api = _MlxApiModule("funasr_mlx.api")
+    api.download_model = download_model
+    api.TranscribeWorker = worker
+    return {"funasr_mlx": ModuleType("funasr_mlx"), "funasr_mlx.api": api}
 
 
 def spec_args(**overrides: object) -> SimpleNamespace:
@@ -732,11 +748,7 @@ class MlxSessionTests(unittest.TestCase):
             downloads.append((repo, variant, Path(dest)))
             return Path(dest) / str(variant)
 
-        package = ModuleType("funasr_mlx")
-        api = ModuleType("funasr_mlx.api")
-        api.download_model = download_model  # type: ignore[attr-defined]
-        api.TranscribeWorker = TranscribeWorker  # type: ignore[attr-defined]
-        with patch.dict(sys.modules, {"funasr_mlx": package, "funasr_mlx.api": api}):
+        with patch.dict(sys.modules, _mlx_modules(download_model, TranscribeWorker)):
             self.assertEqual(session.transcribe([]), [])
             self.assertEqual(downloads, [])
             result = session.transcribe(["a.wav", "b.wav"])
@@ -775,11 +787,7 @@ class MlxSessionTests(unittest.TestCase):
             def __init__(self, *_args: object, **_kwargs: object) -> None:
                 raise AssertionError("worker should not be built")
 
-        package = ModuleType("funasr_mlx")
-        api = ModuleType("funasr_mlx.api")
-        api.download_model = download_model  # type: ignore[attr-defined]
-        api.TranscribeWorker = TranscribeWorker  # type: ignore[attr-defined]
-        with patch.dict(sys.modules, {"funasr_mlx": package, "funasr_mlx.api": api}):
+        with patch.dict(sys.modules, _mlx_modules(download_model, TranscribeWorker)):
             with self.assertRaises(ValueError):
                 session.prepare()
 
@@ -805,11 +813,7 @@ class MlxSessionTests(unittest.TestCase):
         ) -> Path:
             return Path(dest) / str(variant)
 
-        package = ModuleType("funasr_mlx")
-        api = ModuleType("funasr_mlx.api")
-        api.download_model = download_model  # type: ignore[attr-defined]
-        api.TranscribeWorker = TranscribeWorker  # type: ignore[attr-defined]
-        with patch.dict(sys.modules, {"funasr_mlx": package, "funasr_mlx.api": api}):
+        with patch.dict(sys.modules, _mlx_modules(download_model, TranscribeWorker)):
             with self.assertRaisesRegex(RuntimeError, "text"):
                 session.transcribe(["a.wav"])
             self.assertEqual(session.transcribe([]), [])

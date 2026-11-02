@@ -110,7 +110,7 @@ class FunasrVllm:
 
 
 MLX_NANO = "fun-asr-nano-mlx"
-MLX_NANO_VARIANT = "w4a16"  # only variant the catalog emits
+MLX_NANO_VARIANT = "w4a16"
 
 
 @dataclass(frozen=True)
