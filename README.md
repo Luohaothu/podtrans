@@ -70,7 +70,7 @@ python -m pip install ".[inference]"
 python -m pip install ".[vllm]"
 ```
 
-The `mlx` extra is for macOS Apple Silicon. The Apple MLX path is unvalidated.
+The `mlx` extra is for Apple Silicon macOS. The Apple MLX path is unvalidated.
 
 ```bash
 python -m pip install ".[mlx]"
@@ -118,7 +118,7 @@ export PODTRANS_DATA_DIR=/path/to/podcast-data
 
 `profiles` and `recommend` are gone. Hardware selection is flags on `transcribe`, `diarize`, `diarize-batch`, and `speaker-service`.
 
-Apple ASR above the 8GB floor targets MLX through funasr-mlx (`--backend mlx`), not PyTorch MPS. The 8GB floor stays on CPU FunASR. `quality` keeps that Apple ASR on CPU FunASR. `speed` does not select MPS. CPU FunASR and PyTorch MPS remain selectable with a trailing `--device cpu` or `--device mps` on `transcribe`. Speaker and VAD stay on CPU. Apple rows are unvalidated. Splash is out of scope for ASR. Install the extra with `pip install 'podtrans[mlx]'` on macOS. That extra also installs FunASR and PyTorch, which the 8GB tier, `quality`, the CPU and MPS benchmarks, and in-process diarization import. Start is still `podtrans transcribe`. The process downloads `fun-asr-nano-mlx` variant `w4a16` on first use. This path has not been run on the project machine.
+Apple ASR above the 8GB floor targets MLX through funasr-mlx (`--backend mlx`), not PyTorch MPS. The 8GB floor stays on CPU FunASR. `quality` keeps that Apple ASR on CPU FunASR. `speed` does not select MPS. CPU FunASR and PyTorch MPS remain selectable with a trailing `--device cpu` or `--device mps` on `transcribe`. Speaker and VAD stay on CPU. Apple rows are unvalidated. Splash is out of scope for ASR. Install the extra with `pip install 'podtrans[mlx]'` on Apple Silicon macOS. That extra also installs FunASR and PyTorch, which the 8GB tier, `quality`, the CPU and MPS benchmarks, and in-process diarization import. Start is still `podtrans transcribe`. The process downloads `fun-asr-nano-mlx` variant `w4a16` on first use. This path has not been run on the project machine.
 
 在功能命令上直接选择硬件，不再提供独立的 `profiles` / `recommend` 子命令。
 
