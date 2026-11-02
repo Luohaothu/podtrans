@@ -7,7 +7,7 @@ import sys
 from collections.abc import Callable
 
 from . import __version__
-from .profiles import resolve_command_argv
+from .profiles import extract_selection, resolve_command_argv
 
 
 Command = tuple[str, str]
@@ -45,7 +45,7 @@ Podcast archiving, transcription, and speaker diarization.
 
 Core commands:
   archive                 Archive RSS metadata and podcast audio
-  transcribe              Transcribe archived audio with FunASR
+  transcribe              Transcribe archived audio with FunASR or an OpenAI-compatible endpoint
   diarize                 Add speaker labels to transcripts
   diarize-batch           Run concurrent diarization with one GPU model service
   speaker-service         Run or check the shared GPU embedding service
@@ -68,6 +68,11 @@ selection flags are provided. diarize-batch always selects a profile.
 Apple and CPU profiles diarize in-process.
 """
     )
+
+
+def _argv_has_flag(argv: list[str], flag: str) -> bool:
+    prefix = flag + "="
+    return any(arg == flag or arg.startswith(prefix) for arg in argv)
 
 
 def load_command(command: str) -> Callable[[list[str]], int]:
@@ -103,6 +108,16 @@ def main(argv: list[str] | None = None) -> int:
         if command not in COMMANDS:
             raise ValueError(f"unknown command {command!r}")
         if command in PROFILE_AWARE_COMMANDS:
+            request, rest = extract_selection(command_args)
+            if (
+                command == "transcribe"
+                and request.profile is not None
+                and _argv_has_flag(rest, "--asr-url")
+            ):
+                raise ValueError(
+                    "--profile configures in-process FunASR; "
+                    "--asr-url does not take a hardware profile"
+                )
             command_args = resolve_command_argv(command, command_args)
         entry = load_command(command)
         try:

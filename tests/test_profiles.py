@@ -441,6 +441,72 @@ class CliProfileTests(unittest.TestCase):
         self.assertNotIn("  profiles", text)
         self.assertNotIn("  recommend", text)
 
+    def test_profile_with_asr_url_is_rejected_before_transcribe(self) -> None:
+        output = io.StringIO()
+        with (
+            patch("podtrans.cli.load_command") as load_command,
+            redirect_stderr(output),
+        ):
+            exit_code = cli.main(
+                [
+                    "transcribe",
+                    "--profile",
+                    "gpu-24gb",
+                    "--asr-url",
+                    "http://127.0.0.1:8000/v1",
+                    "--model",
+                    "whisper",
+                ]
+            )
+        self.assertEqual(exit_code, 2)
+        load_command.assert_not_called()
+        self.assertIn(
+            "--profile configures in-process FunASR; "
+            "--asr-url does not take a hardware profile",
+            output.getvalue(),
+        )
+
+        output.truncate(0)
+        output.seek(0)
+        with (
+            patch("podtrans.cli.load_command") as load_command,
+            redirect_stderr(output),
+        ):
+            exit_code = cli.main(
+                [
+                    "transcribe",
+                    "--asr-url=http://127.0.0.1:8000/v1",
+                    "--profile=cpu",
+                    "--model",
+                    "whisper",
+                ]
+            )
+        self.assertEqual(exit_code, 2)
+        load_command.assert_not_called()
+
+    def test_asr_url_without_profile_reaches_transcribe(self) -> None:
+        captured: list[str] = []
+
+        def command(args: list[str]) -> int:
+            captured.extend(args)
+            return 0
+
+        with patch("podtrans.cli.load_command", return_value=command):
+            exit_code = cli.main(
+                [
+                    "transcribe",
+                    "--asr-url",
+                    "http://127.0.0.1:8000/v1",
+                    "--model",
+                    "whisper",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            captured,
+            ["--asr-url", "http://127.0.0.1:8000/v1", "--model", "whisper"],
+        )
+
     def test_runtime_missing_dependency_has_install_hint(self) -> None:
         error = ModuleNotFoundError("No module named 'funasr'", name="funasr")
 
