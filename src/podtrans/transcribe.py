@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe archived podcast audio with FunASR."""
+"""Transcribe archived podcast audio with FunASR or an OpenAI-compatible server."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from . import archive
+from .asr import DEFAULT_MODEL, AsrSession, AsrSource, open_asr, parse_asr_spec
 
 
 ROOT = archive.ROOT
-DEFAULT_MODEL = "FunAudioLLM/Fun-ASR-Nano-2512"
 REPORT_FILE = ROOT / "_metadata" / "transcription_report.json"
 MANIFEST_FILE = ROOT / "_metadata" / "transcription_manifest.jsonl"
 
@@ -245,96 +245,26 @@ def convert_batch(
     return outputs, errors
 
 
-def create_model(args: argparse.Namespace) -> Any:
-    if args.backend == "vllm":
-        from funasr.auto.auto_model_vllm import AutoModelVLLM
-
-        return AutoModelVLLM(
-            model=args.model,
-            device=args.device,
-            dtype=args.vllm_dtype,
-            tensor_parallel_size=args.tensor_parallel_size,
-            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-            max_model_len=args.vllm_max_model_len,
-            enforce_eager=args.vllm_enforce_eager,
-        )
-    from funasr import AutoModel
-
-    return AutoModel(model=args.model, device=args.device, disable_update=True)
-
-
-def call_generate(model: Any, wav_paths: list[str], args: argparse.Namespace) -> Any:
-    kwargs: dict[str, Any] = {}
-    if args.language:
-        kwargs["language"] = args.language
-    if args.max_length is not None:
-        kwargs["max_length"] = args.max_length
-    if args.backend != "vllm":
-        kwargs["batch_size"] = max(1, min(len(wav_paths), args.batch_size))
-    if args.batch_size_s is not None and args.backend != "vllm":
-        kwargs["batch_size_s"] = args.batch_size_s
-    try:
-        if args.backend == "vllm":
-            return model.generate(wav_paths, **kwargs)
-        return model.generate(input=wav_paths if len(wav_paths) > 1 else wav_paths[0], **kwargs)
-    except TypeError:
-        kwargs.pop("batch_size_s", None)
-        if args.backend == "vllm":
-            return model.generate(wav_paths, **kwargs)
-        return model.generate(input=wav_paths if len(wav_paths) > 1 else wav_paths[0], **kwargs)
-
-
-def normalize_results(raw: Any, expected: int) -> list[dict[str, Any]]:
-    if isinstance(raw, dict):
-        results = [raw]
-    elif isinstance(raw, list):
-        results = raw
-    else:
-        results = [{"text": str(raw), "raw": raw}]
-    normalized: list[dict[str, Any]] = []
-    for item in results:
-        if isinstance(item, dict):
-            normalized.append(item)
-        else:
-            normalized.append({"text": str(item), "raw": item})
-    if len(normalized) == expected:
-        return normalized
-    if expected == 1 and normalized:
-        return [normalized[0]]
-    raise RuntimeError(f"model returned {len(normalized)} results for {expected} inputs")
-
-
-def generate_chunk_group(model: Any, group: list[ChunkTask], args: argparse.Namespace) -> dict[ChunkTask, dict[str, Any]]:
-    raw = call_generate(model, [task.wav_path for task in group], args)
-    results = normalize_results(raw, len(group))
-    return dict(zip(group, results))
-
-
 def transcribe_chunks(
-    model: Any,
+    session: AsrSession,
     tasks: list[ChunkTask],
-    args: argparse.Namespace,
 ) -> tuple[dict[ChunkTask, dict[str, Any]], dict[Job, BaseException]]:
     results: dict[ChunkTask, dict[str, Any]] = {}
     errors: dict[Job, BaseException] = {}
-    group_index = 0
     cursor = 0
-    effective_batch_size = max(1, args.batch_size)
+    group_index = 0
     while cursor < len(tasks):
         group_index += 1
-        group = tasks[cursor:cursor + effective_batch_size]
+        group = tasks[cursor:cursor + session.batch_size]
         try:
-            results.update(generate_chunk_group(model, group, args))
-            cursor += len(group)
-            continue
-        except Exception as exc:
-            if isinstance(exc, NotImplementedError) and len(group) > 1:
-                log(
-                    f"[transcribe] chunk_batch={group_index} size={len(group)} "
-                    f"unsupported={exc!r}; disabling chunk batching for this run"
+            raw = session.transcribe([task.wav_path for task in group])
+            if len(raw) != len(group):
+                raise RuntimeError(
+                    f"transcribe returned {len(raw)} results for {len(group)} chunks"
                 )
-                effective_batch_size = 1
-                continue
+            results.update(zip(group, raw))
+            cursor += len(group)
+        except Exception as exc:
             if len(group) == 1:
                 errors[group[0].job] = exc
                 cursor += 1
@@ -343,12 +273,17 @@ def transcribe_chunks(
                 f"[transcribe] chunk_batch={group_index} size={len(group)} failed={exc!r}; "
                 "retrying chunks individually"
             )
-        for task in group:
-            try:
-                results.update(generate_chunk_group(model, [task], args))
-            except Exception as exc:
-                errors[task.job] = exc
-        cursor += len(group)
+            for task in group:
+                try:
+                    raw = session.transcribe([task.wav_path])
+                    if len(raw) != 1:
+                        raise RuntimeError(
+                            f"transcribe returned {len(raw)} results for 1 chunk"
+                        )
+                    results[task] = raw[0]
+                except Exception as item_exc:
+                    errors[task.job] = item_exc
+            cursor += len(group)
     return results, errors
 
 
@@ -395,15 +330,17 @@ def aggregate_chunk_results(
     }
 
 
-def write_transcript(job: Job, result: dict[str, Any], meta: dict[str, Any], args: argparse.Namespace) -> None:
+def write_transcript(job: Job, result: dict[str, Any], meta: dict[str, Any], source: AsrSource) -> None:
     text = transcript_text(result)
     durable_meta = {key: value for key, value in meta.items() if key not in {"wav_path", "chunk_paths"}}
+    if source.endpoint is not None:
+        durable_meta["asr_url"] = source.endpoint
     payload = {
         "status": "ok",
         "generated_at": utc_now(),
-        "model": args.model,
-        "backend": args.backend,
-        "device": args.device,
+        "model": source.model,
+        "backend": source.backend,
+        "device": source.device,
         "channel": job.channel,
         "number": job.number,
         "title": job.title,
@@ -419,9 +356,9 @@ def write_transcript(job: Job, result: dict[str, Any], meta: dict[str, Any], arg
         f"# {job.number} {job.title}",
         "",
         f"- Channel: {job.channel}",
-        f"- Model: {args.model}",
-        f"- Backend: {args.backend}",
-        f"- Device: {args.device}",
+        f"- Model: {source.model}",
+        f"- Backend: {source.backend}",
+        f"- Device: {source.device}",
         f"- Audio: `{job.audio_path.name}`",
         f"- Generated at: {payload['generated_at']}",
         "",
@@ -433,13 +370,13 @@ def write_transcript(job: Job, result: dict[str, Any], meta: dict[str, Any], arg
     job.transcript_md.write_text("\n".join(md), encoding="utf-8")
 
 
-def write_error(job: Job, exc: BaseException, args: argparse.Namespace) -> None:
+def write_error(job: Job, exc: BaseException, source: AsrSource) -> None:
     payload = {
         "status": "error",
         "generated_at": utc_now(),
-        "model": args.model,
-        "backend": args.backend,
-        "device": args.device,
+        "model": source.model,
+        "backend": source.backend,
+        "device": source.device,
         "channel": job.channel,
         "number": job.number,
         "title": job.title,
@@ -521,30 +458,49 @@ def verify_only() -> int:
     return 0 if report["pending"] == 0 and report["transcript_error"] == 0 and report["missing_audio"] == 0 else 1
 
 
-def main(argv: list[str]) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="podtrans transcribe",
         description=__doc__,
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--backend", choices=["auto", "vllm"], default="auto")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=f"ASR model id. In-process runs default to {DEFAULT_MODEL}. Required with --asr-url",
+    )
+    parser.add_argument(
+        "--asr-url",
+        default=None,
+        help="OpenAI-compatible API root ending in /v1, or a full /audio/transcriptions URL",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "vllm"],
+        default=None,
+        help="in-process backend. Omitted means auto",
+    )
+    parser.add_argument("--device", default=None, help="in-process device. Omitted means cuda")
     parser.add_argument("--language", default="auto")
-    parser.add_argument("--batch-size", type=int, default=4, help="audio chunks per model.generate call and AutoModel batch")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="chunks per generate call, or in-flight requests with --asr-url",
+    )
     parser.add_argument("--batch-size-s", type=int, default=None, help="FunASR batch_size_s for non-vLLM backend")
     parser.add_argument("--chunk-seconds", type=int, default=30, help="seconds per audio chunk before ASR")
-    parser.add_argument("--max-length", type=int, default=256, help="FunASR max_length per chunk")
+    parser.add_argument("--max-length", type=int, default=None, help="FunASR max_length per chunk. Omitted means 256")
     parser.add_argument("--job-batch-size", type=int, default=2, help="episode files converted per outer batch")
     parser.add_argument("--decode-workers", type=int, default=2, help="parallel ffmpeg conversions per batch")
-    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--tensor-parallel-size", type=int, default=None)
     parser.add_argument(
         "--vllm-dtype",
-        default="bfloat16",
-        help="AutoModelVLLM dtype; use bfloat16 on Ampere-or-newer GPUs",
+        default=None,
+        help="AutoModelVLLM dtype. Omitted means bfloat16",
     )
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.8)
-    parser.add_argument("--vllm-max-model-len", type=int, default=4096)
-    parser.add_argument("--vllm-enforce-eager", action="store_true")
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=None)
+    parser.add_argument("--vllm-max-model-len", type=int, default=None)
+    parser.add_argument("--vllm-enforce-eager", action="store_true", default=None)
     parser.add_argument("--channel", action="append", help="only transcribe this channel; can be repeated")
     parser.add_argument("--episode-dir", action="append", help="only transcribe this episode directory; can be repeated")
     parser.add_argument("--limit", type=int, help="limit selected jobs for smoke tests")
@@ -555,7 +511,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--temp-dir", type=Path, default=ROOT / "_metadata" / "transcription_tmp")
     parser.add_argument("--verify-only", action="store_true")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
 
     if args.verify_only:
         return verify_only()
@@ -563,8 +523,8 @@ def main(argv: list[str]) -> int:
         raise ValueError("--chunk-seconds must be positive")
     if args.job_batch_size <= 0:
         raise ValueError("--job-batch-size must be positive")
-    if args.backend == "auto":
-        args.backend = "auto_model"
+    spec = parse_asr_spec(args)
+    session = open_asr(spec)
 
     channel_filter = set(args.channel) if args.channel else None
     episode_dir_filter = {Path(path).resolve() for path in args.episode_dir} if args.episode_dir else None
@@ -580,17 +540,16 @@ def main(argv: list[str]) -> int:
         jobs = jobs[: args.limit]
     log(
         f"[transcribe] selected={len(jobs)} skipped_missing_or_empty={len(skipped)} "
-        f"backend={args.backend} device={args.device} sort={args.sort}"
+        f"backend={session.source.backend} model={session.source.model} "
+        f"device={session.source.device} endpoint={session.source.endpoint} sort={args.sort}"
     )
     if not jobs:
         write_report(jobs_total=0, skipped=skipped, processed=0, ok=0, errors=0)
         return verify_only()
 
+    session.prepare()
     ffmpeg = find_ffmpeg()
     log(f"[transcribe] ffmpeg={ffmpeg}")
-    started = time.time()
-    model = create_model(args)
-    log(f"[transcribe] model_loaded seconds={time.time() - started:.2f}")
 
     processed = 0
     ok = 0
@@ -618,7 +577,7 @@ def main(argv: list[str]) -> int:
                 ]
                 log(f"[transcribe] batch={batch_index} chunks={len(tasks)}")
                 if tasks:
-                    chunk_result_map, chunk_errors = transcribe_chunks(model, tasks, args)
+                    chunk_result_map, chunk_errors = transcribe_chunks(session, tasks)
                 else:
                     chunk_result_map, chunk_errors = {}, {}
                 for job in batch:
@@ -632,7 +591,7 @@ def main(argv: list[str]) -> int:
                     if missing and job_error is None:
                         job_error = RuntimeError(f"missing chunk results for indexes {missing}")
                     if job_error is not None:
-                        write_error(job, job_error, args)
+                        write_error(job, job_error, session.source)
                         errors += 1
                         processed += 1
                         records.append(
@@ -647,13 +606,13 @@ def main(argv: list[str]) -> int:
                     chunk_results = [chunk_result_map[task] for task in sorted(job_tasks, key=lambda task: task.index)]
                     result = aggregate_chunk_results(job, chunk_results, args)
                     meta = conversion[job] | {"batch_index": batch_index}
-                    write_transcript(job, result, meta, args)
+                    write_transcript(job, result, meta, session.source)
                     ok += 1
                     processed += 1
                     records.append({"time": utc_now(), "status": "ok", "path": rel(job.transcript_json)})
             except Exception as exc:
                 for job in batch:
-                    write_error(job, exc, args)
+                    write_error(job, exc, session.source)
                     errors += 1
                     processed += 1
                     records.append({"time": utc_now(), "status": "error", "path": rel(job.transcript_json), "error": repr(exc)})

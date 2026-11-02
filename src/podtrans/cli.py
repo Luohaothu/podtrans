@@ -55,7 +55,7 @@ Podcast archiving, transcription, and speaker diarization.
 
 Core commands:
   archive                 Archive RSS metadata and podcast audio
-  transcribe              Transcribe archived audio with FunASR
+  transcribe              Transcribe archived audio with FunASR or an OpenAI-compatible endpoint
   diarize                 Add speaker labels to transcripts
   diarize-batch           Run concurrent diarization with one GPU model service
   speaker-service         Run or check the shared GPU embedding service
@@ -176,6 +176,11 @@ def recommend_main(argv: list[str]) -> int:
     return 0
 
 
+def _argv_has_flag(argv: list[str], flag: str) -> bool:
+    prefix = flag + "="
+    return any(arg == flag or arg.startswith(prefix) for arg in argv)
+
+
 def load_command(command: str) -> Callable[[list[str]], int]:
     module_name, function_name = COMMANDS[command]
     try:
@@ -215,6 +220,15 @@ def main(argv: list[str] | None = None) -> int:
         profile_name = None
         if command in PROFILE_AWARE_COMMANDS:
             profile_name, command_args = extract_profile(command_args)
+        if (
+            command == "transcribe"
+            and profile_name is not None
+            and _argv_has_flag(command_args, "--asr-url")
+        ):
+            raise ValueError(
+                "--profile configures in-process FunASR; "
+                "--asr-url does not take a hardware profile"
+            )
         if profile_name is not None:
             profile = get_profile(profile_name)
             command_args = command_arguments(profile, command) + command_args
