@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -178,6 +179,31 @@ def find_ffmpeg() -> str:
     except Exception as exc:
         raise RuntimeError("ffmpeg is not on PATH and imageio-ffmpeg is unavailable") from exc
     return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def read_mlx_frontend_max_seconds() -> float:
+    from funasr_mlx.frontend import FbankConfig
+
+    return float(FbankConfig().max_seconds)
+
+
+def chunk_seconds_within_frontend(configured: int, max_seconds: float) -> int:
+    """Integer segment length that stays inside the frontend sample bound.
+
+    ``ffmpeg -segment_time`` finishes the packet that crosses the cut, so a
+    target equal to ``max_seconds`` can emit a longer chunk. One second of
+    slack covers that overhang. The bound is the caller's value.
+    """
+    if configured < 1:
+        raise ValueError("--chunk-seconds must be positive")
+    if not math.isfinite(max_seconds) or max_seconds <= 0:
+        raise ValueError("frontend max_seconds must be positive")
+    allowed = math.floor(max_seconds - 1)
+    if allowed < 1:
+        raise ValueError(
+            f"frontend max_seconds={max_seconds:g} leaves no 1 second chunk under the bound"
+        )
+    return min(configured, allowed)
 
 
 def convert_to_chunks(ffmpeg: str, job: Job, chunk_dir: Path, chunk_seconds: int) -> dict[str, Any]:
@@ -551,6 +577,16 @@ def main(argv: list[str]) -> int:
     if not jobs:
         write_report(jobs_total=0, skipped=skipped, processed=0, ok=0, errors=0)
         return verify_only()
+
+    if session.source.backend == "mlx":
+        limit = read_mlx_frontend_max_seconds()
+        bounded = chunk_seconds_within_frontend(args.chunk_seconds, limit)
+        if bounded != args.chunk_seconds:
+            log(
+                f"[transcribe] chunk_seconds={args.chunk_seconds} "
+                f"capped to {bounded} for frontend max_seconds={limit:g}"
+            )
+        args.chunk_seconds = bounded
 
     session.prepare()
     ffmpeg = find_ffmpeg()
