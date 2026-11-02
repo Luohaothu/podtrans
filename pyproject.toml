@@ -39,6 +39,9 @@ vllm = [
     "torchaudio>=2.6,<3",
     "vllm>=0.15,<1; platform_system == 'Linux'",
 ]
+mlx = [
+    "funasr-mlx>=0.2,<1; platform_system == 'Darwin'",
+]
 
 [project.scripts]
 podtrans = "podtrans.cli:main"

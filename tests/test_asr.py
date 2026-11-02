@@ -17,6 +17,7 @@ from podtrans.asr import (
     SHARED_ASR_FLAGS,
     AsrSource,
     AutoModelAsr,
+    MlxAsr,
     RemoteAsr,
     VllmAsr,
     _NoRedirectHandler,
@@ -39,6 +40,7 @@ def spec_args(**overrides: object) -> SimpleNamespace:
         "batch_size": 4,
         "backend": None,
         "device": None,
+        "mlx_variant": None,
         "batch_size_s": None,
         "max_length": None,
         "tensor_parallel_size": None,
@@ -634,6 +636,185 @@ class LocalSessionTests(unittest.TestCase):
         self.assertIs(constructed[0]["enforce_eager"], False)
 
 
+class MlxSessionTests(unittest.TestCase):
+    def test_mlx_argv_builds_an_mlx_spec_without_importing_funasr_mlx(self) -> None:
+        parsed = build_parser().parse_args(
+            [
+                "--model",
+                "fun-asr-nano-mlx",
+                "--backend",
+                "mlx",
+                "--mlx-variant",
+                "w4a16",
+                "--batch-size",
+                "1",
+            ]
+        )
+        spec = parse_asr_spec(parsed)
+        self.assertIsInstance(spec, MlxAsr)
+        assert isinstance(spec, MlxAsr)
+        self.assertEqual(spec.model, "fun-asr-nano-mlx")
+        self.assertEqual(spec.variant, "w4a16")
+        self.assertEqual(spec.batch_size, 1)
+        session = open_asr(spec)
+        self.assertEqual(session.source.backend, "mlx")
+        self.assertEqual(session.source.device, "mlx")
+        self.assertIsNone(session.source.endpoint)
+        self.assertEqual(session.batch_size, 1)
+        self.assertNotIn("funasr_mlx", sys.modules)
+
+    def test_mlx_rejects_torch_and_vllm_flags(self) -> None:
+        parser = build_parser()
+        base = [
+            "--backend",
+            "mlx",
+            "--model",
+            "fun-asr-nano-mlx",
+            "--mlx-variant",
+            "w4a16",
+        ]
+        rejected = (
+            ["--device", "mps"],
+            ["--batch-size-s", "30"],
+            ["--max-length", "128"],
+            ["--vllm-dtype", "float16"],
+            ["--language", "zh"],
+        )
+        for extra in rejected:
+            with self.subTest(extra=extra):
+                with self.assertRaises(ValueError):
+                    parse_asr_spec(parser.parse_args([*base, *extra]))
+        with self.assertRaisesRegex(ValueError, "--model"):
+            parse_asr_spec(parser.parse_args(["--backend", "mlx", "--mlx-variant", "w4a16"]))
+        with self.assertRaisesRegex(ValueError, "--mlx-variant"):
+            parse_asr_spec(parser.parse_args(["--backend", "mlx", "--model", "fun-asr-nano-mlx"]))
+
+    def test_mlx_session_transcribes_each_path_from_a_stub(self) -> None:
+        spec = parse_asr_spec(
+            spec_args(
+                backend="mlx",
+                model="fun-asr-nano-mlx",
+                mlx_variant="w4a16",
+                batch_size=2,
+            )
+        )
+        session = open_asr(spec)
+        self.assertNotIn("funasr_mlx", sys.modules)
+        downloads: list[tuple[str, str | None, Path]] = []
+        constructed: list[tuple[Path, str | None, int]] = []
+        calls: list[str] = []
+
+        class TranscribeWorker:
+            def __init__(
+                self,
+                checkpoint: Path,
+                *,
+                family: str | None = None,
+                max_tokens: int = 96,
+            ) -> None:
+                constructed.append((Path(checkpoint), family, max_tokens))
+
+            def transcribe(self, audio: str) -> dict[str, object]:
+                calls.append(str(audio))
+                return {
+                    "text": "hello",
+                    "token_ids": [1],
+                    "family": "fun-asr-nano",
+                    "wall_ms": 4,
+                }
+
+        def download_model(
+            repo: str,
+            *,
+            variant: str | None = None,
+            dest: Path | str = ".",
+        ) -> Path:
+            downloads.append((repo, variant, Path(dest)))
+            return Path(dest) / str(variant)
+
+        package = ModuleType("funasr_mlx")
+        api = ModuleType("funasr_mlx.api")
+        api.download_model = download_model  # type: ignore[attr-defined]
+        api.TranscribeWorker = TranscribeWorker  # type: ignore[attr-defined]
+        with patch.dict(sys.modules, {"funasr_mlx": package, "funasr_mlx.api": api}):
+            self.assertEqual(session.transcribe([]), [])
+            self.assertEqual(downloads, [])
+            result = session.transcribe(["a.wav", "b.wav"])
+            again = session.transcribe(["c.wav"])
+        self.assertEqual(
+            result,
+            [{"text": "hello", "timestamps": []}, {"text": "hello", "timestamps": []}],
+        )
+        self.assertEqual(again, [{"text": "hello", "timestamps": []}])
+        self.assertEqual(calls, ["a.wav", "b.wav", "c.wav"])
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(len(constructed), 1)
+        self.assertEqual(downloads[0][0], "fun-asr-nano-mlx")
+        self.assertEqual(downloads[0][1], "w4a16")
+        self.assertEqual(downloads[0][2], ROOT / "models" / "funasr-mlx")
+        self.assertTrue(downloads[0][2].is_absolute())
+        self.assertEqual(constructed[0], (downloads[0][2] / "w4a16", "fun-asr-nano", 96))
+        self.assertNotIn("funasr_mlx", sys.modules)
+
+    def test_mlx_prepare_rejects_a_checkpoint_whose_name_is_not_the_variant(self) -> None:
+        session = open_asr(
+            parse_asr_spec(
+                spec_args(backend="mlx", model="fun-asr-nano-mlx", mlx_variant="w4a16")
+            )
+        )
+
+        def download_model(
+            _repo: str,
+            *,
+            variant: str | None = None,
+            dest: Path | str = ".",
+        ) -> Path:
+            return Path(dest) / "other"
+
+        class TranscribeWorker:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                raise AssertionError("worker should not be built")
+
+        package = ModuleType("funasr_mlx")
+        api = ModuleType("funasr_mlx.api")
+        api.download_model = download_model  # type: ignore[attr-defined]
+        api.TranscribeWorker = TranscribeWorker  # type: ignore[attr-defined]
+        with patch.dict(sys.modules, {"funasr_mlx": package, "funasr_mlx.api": api}):
+            with self.assertRaises(ValueError):
+                session.prepare()
+
+    def test_mlx_transcribe_rejects_a_worker_result_without_text(self) -> None:
+        session = open_asr(
+            parse_asr_spec(
+                spec_args(backend="mlx", model="fun-asr-nano-mlx", mlx_variant="w4a16")
+            )
+        )
+
+        class TranscribeWorker:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def transcribe(self, _audio: str) -> dict[str, object]:
+                return {"token_ids": [1], "family": "fun-asr-nano", "wall_ms": 1}
+
+        def download_model(
+            _repo: str,
+            *,
+            variant: str | None = None,
+            dest: Path | str = ".",
+        ) -> Path:
+            return Path(dest) / str(variant)
+
+        package = ModuleType("funasr_mlx")
+        api = ModuleType("funasr_mlx.api")
+        api.download_model = download_model  # type: ignore[attr-defined]
+        api.TranscribeWorker = TranscribeWorker  # type: ignore[attr-defined]
+        with patch.dict(sys.modules, {"funasr_mlx": package, "funasr_mlx.api": api}):
+            with self.assertRaisesRegex(RuntimeError, "text"):
+                session.transcribe(["a.wav"])
+            self.assertEqual(session.transcribe([]), [])
+
+
 class RedirectAndPrepareTests(unittest.TestCase):
     def test_redirect_handler_refuses_to_follow(self) -> None:
         handler = _NoRedirectHandler()
@@ -798,6 +979,11 @@ class TranscribeBoundaryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "--device"):
             parse_asr_spec(remote_conflict)
+        variant_conflict = parser.parse_args(
+            ["--asr-url", URL, "--model", "whisper", "--mlx-variant", "w4a16"]
+        )
+        with self.assertRaisesRegex(ValueError, "--mlx-variant"):
+            parse_asr_spec(variant_conflict)
 
     def test_group_failure_retries_each_wav_without_shrinking_later_groups(self) -> None:
         calls: list[list[str]] = []

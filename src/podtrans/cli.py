@@ -75,16 +75,28 @@ def _argv_has_flag(argv: list[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(prefix) for arg in argv)
 
 
+def _dependency_error(exc: ModuleNotFoundError) -> RuntimeError | None:
+    if exc.name in {"funasr_mlx", "mlx"}:
+        return RuntimeError(
+            f"missing dependency {exc.name!r}; install `podtrans[mlx]`, "
+            "the Apple Silicon extra"
+        )
+    if exc.name in INFERENCE_MODULES:
+        return RuntimeError(
+            f"missing inference dependency {exc.name!r}; install "
+            "`podtrans[inference]` or `podtrans[vllm]`"
+        )
+    return None
+
+
 def load_command(command: str) -> Callable[[list[str]], int]:
     module_name, function_name = COMMANDS[command]
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
-        if exc.name in INFERENCE_MODULES:
-            raise RuntimeError(
-                f"missing inference dependency {exc.name!r}; install "
-                "`podtrans[inference]` or `podtrans[vllm]`"
-            ) from exc
+        dependency_error = _dependency_error(exc)
+        if dependency_error is not None:
+            raise dependency_error from exc
         raise
     return getattr(module, function_name)
 
@@ -123,11 +135,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return int(entry(command_args))
         except ModuleNotFoundError as exc:
-            if exc.name in INFERENCE_MODULES:
-                raise RuntimeError(
-                    f"missing inference dependency {exc.name!r}; install "
-                    "`podtrans[inference]` or `podtrans[vllm]`"
-                ) from exc
+            dependency_error = _dependency_error(exc)
+            if dependency_error is not None:
+                raise dependency_error from exc
             raise
     except (RuntimeError, ValueError) as exc:
         print(f"podtrans: error: {exc}", file=sys.stderr)

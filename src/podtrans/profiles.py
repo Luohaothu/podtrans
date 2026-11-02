@@ -109,7 +109,23 @@ class FunasrVllm:
             raise ValueError("vLLM memory utilization must be in (0, 1)")
 
 
-AsrPair = FunasrAuto | FunasrVllm
+MLX_NANO = "fun-asr-nano-mlx"
+MLX_NANO_VARIANT = "w4a16"  # only variant the catalog emits
+
+
+@dataclass(frozen=True)
+class FunasrMlx:
+    model: str = MLX_NANO
+    variant: str = MLX_NANO_VARIANT
+
+    def __post_init__(self) -> None:
+        if self.model != MLX_NANO:
+            raise ValueError("funasr-mlx catalog model must be fun-asr-nano-mlx")
+        if self.variant != MLX_NANO_VARIANT:
+            raise ValueError("funasr-mlx catalog variant must be w4a16")
+
+
+AsrPair = FunasrAuto | FunasrVllm | FunasrMlx
 
 
 @dataclass(frozen=True)
@@ -193,8 +209,9 @@ class HardwareProfile:
             if self.asr.device != "cuda":
                 raise ValueError("NVIDIA ASR must run on CUDA")
         elif isinstance(self.match, UnifiedKey):
-            if not isinstance(self.asr, FunasrAuto) or self.asr.device not in {"cpu", "mps"}:
-                raise ValueError("Apple ASR uses the auto backend on cpu or mps")
+            cpu_auto = isinstance(self.asr, FunasrAuto) and self.asr.device == "cpu"
+            if not isinstance(self.asr, FunasrMlx) and not cpu_auto:
+                raise ValueError("Apple ASR is funasr-mlx, or FunASR auto on CPU")
             if not isinstance(self.speaker, InProcessSpeaker):
                 raise ValueError("Apple profiles run diarization in-process")
             if self.speaker.device != "cpu" or self.speaker.vad_device != "cpu":
@@ -227,9 +244,12 @@ class HardwareProfile:
         return "CPU"
 
     def asr_pair_label(self) -> str:
-        backend = "vllm" if isinstance(self.asr, FunasrVllm) else "auto"
-        model = self.asr.model.rsplit("/", 1)[-1]
-        return f"{backend}/{model}@{self.asr.device}"
+        asr = self.asr
+        if isinstance(asr, FunasrMlx):
+            return f"mlx/{asr.model}@{asr.variant}"
+        backend = "vllm" if isinstance(asr, FunasrVllm) else "auto"
+        model = asr.model.rsplit("/", 1)[-1]
+        return f"{backend}/{model}@{asr.device}"
 
     def mode_label(self) -> str:
         if self.uses_speaker_service:
@@ -241,6 +261,14 @@ def _nano(device: Literal["cpu", "cuda", "mps"]) -> FunasrAuto:
     return FunasrAuto(ASR_NANO, device)
 
 
+def _apple_floor_asr(memory_gb: int) -> FunasrAuto | FunasrMlx:
+    if memory_gb == 8:
+        return _nano("cpu")
+    if memory_gb > 8:
+        return FunasrMlx()
+    raise ValueError(f"Apple memory floor must be at least 8GB, got {memory_gb}")
+
+
 @dataclass(frozen=True)
 class AppleRecipe:
     """One pre-compiled Apple catalog row: generation band × unified-memory floor."""
@@ -248,7 +276,7 @@ class AppleRecipe:
     generation_lo: int
     generation_hi: int | None
     memory_gb: int
-    asr: FunasrAuto
+    asr: FunasrAuto | FunasrMlx
     asr_batch_size: int
     asr_job_batch_size: int
     asr_decode_workers: int
@@ -271,7 +299,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         8,
-        _nano("cpu"),
+        _apple_floor_asr(8),
         1,
         1,
         1,
@@ -280,7 +308,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         (
             "Fun-ASR-Nano on CPU with small batches. "
-            "8GB unified leaves no room for MPS copies. "
+            "The 8GB floor stays on CPU FunASR. "
             "Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
@@ -288,7 +316,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         16,
-        _nano("cpu"),
+        _apple_floor_asr(16),
         1,
         1,
         2,
@@ -296,15 +324,15 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "Fun-ASR-Nano on CPU. Early MPS is not assumed correct for this 800M checkpoint. "
-            "Unvalidated starting point."
+            "funasr-mlx fun-asr-nano-mlx w4a16. "
+            "Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
     AppleRecipe(
         1,
         2,
         32,
-        _nano("mps"),
+        _apple_floor_asr(32),
         1,
         1,
         2,
@@ -312,7 +340,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "Fun-ASR-Nano on MPS. 32GB is the early-chip headroom for MPS fallback copies. "
+            "funasr-mlx fun-asr-nano-mlx w4a16. "
             "Speaker stays on CPU. Unvalidated starting point."
         ),
     ),
@@ -320,7 +348,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         64,
-        _nano("mps"),
+        _apple_floor_asr(64),
         2,
         1,
         2,
@@ -328,7 +356,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "Same Nano-on-MPS pair as the 32GB early rung, with a larger ASR batch. "
+            "funasr-mlx fun-asr-nano-mlx w4a16, with a larger ASR batch. "
             "Unvalidated starting point."
         ),
     ),
@@ -336,7 +364,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         3,
         None,
         8,
-        _nano("cpu"),
+        _apple_floor_asr(8),
         1,
         1,
         2,
@@ -344,7 +372,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "Fun-ASR-Nano on CPU. A newer GPU does not move the 8GB rung onto MPS. "
+            "Fun-ASR-Nano on CPU. The 8GB floor stays on CPU FunASR. "
             "Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
@@ -352,7 +380,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         3,
         None,
         16,
-        _nano("mps"),
+        _apple_floor_asr(16),
         1,
         1,
         2,
@@ -360,28 +388,28 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "Fun-ASR-Nano on MPS. Modern GPU, batch 1. Speaker and VAD stay on CPU. "
-            "Unvalidated starting point."
+            "funasr-mlx fun-asr-nano-mlx w4a16, batch 1. "
+            "Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
     AppleRecipe(
         3,
         None,
         32,
-        _nano("mps"),
+        _apple_floor_asr(32),
         2,
         2,
         4,
         64,
         2,
         2,
-        "Fun-ASR-Nano on MPS, batch 2. Unvalidated starting point.",
+        "funasr-mlx fun-asr-nano-mlx w4a16, batch 2. Unvalidated starting point.",
     ),
     AppleRecipe(
         3,
         None,
         64,
-        _nano("mps"),
+        _apple_floor_asr(64),
         4,
         2,
         4,
@@ -389,7 +417,8 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         2,
         4,
         (
-            "Fun-ASR-Nano on MPS, batch 4. Still one in-process diarize worker. "
+            "funasr-mlx fun-asr-nano-mlx w4a16, batch 4. "
+            "Still one in-process diarize worker. "
             "Unvalidated starting point."
         ),
     ),
@@ -695,8 +724,10 @@ def _validate_catalog(profiles: tuple[HardwareProfile, ...]) -> None:
         if floors != sorted(floors) or len(floors) != len(set(floors)):
             raise RuntimeError("Apple memory floors must be strictly increasing")
         for recipe in _recipes_for(generation):
-            if recipe.asr.model != ASR_NANO:
-                raise RuntimeError("Apple recipes use Fun-ASR-Nano")
+            if recipe.asr != _apple_floor_asr(recipe.memory_gb):
+                raise RuntimeError(
+                    f"Apple floor {recipe.memory_gb}GB does not match the ASR floor rule"
+                )
     nvidia = [profile for profile in profiles if isinstance(profile.match, VramKey)]
     expected = {
         "gpu-4gb": 4,
@@ -846,11 +877,23 @@ def resolved_profile(
     else:
         vad_model = VAD_FSMN
         vad_device = "cpu"
+    if isinstance(asr, FunasrMlx):
+        asr_backend = "mlx"
+        asr_device = None
+        asr_mlx_variant: str | None = asr.variant
+    elif isinstance(asr, FunasrVllm):
+        asr_backend = "vllm"
+        asr_device = asr.device
+        asr_mlx_variant = None
+    else:
+        asr_backend = "auto"
+        asr_device = asr.device
+        asr_mlx_variant = None
     return {
         "name": profile.name,
         "vram_gb": match.gb if isinstance(match, VramKey) else None,
         "examples": list(profile.examples),
-        "asr_backend": "vllm" if isinstance(asr, FunasrVllm) else "auto",
+        "asr_backend": asr_backend,
         "asr_batch_size": profile.asr_batch_size,
         "asr_job_batch_size": profile.asr_job_batch_size,
         "asr_decode_workers": asr_decode_workers,
@@ -871,7 +914,8 @@ def resolved_profile(
         "service_cpu_threads": service_cpu_threads,
         "family": profile.family.value,
         "asr_model": asr.model,
-        "asr_device": asr.device,
+        "asr_device": asr_device,
+        "asr_mlx_variant": asr_mlx_variant,
         "speaker_model": speaker.model,
         "speaker_device": speaker.device,
         "vad_model": vad_model,
@@ -897,6 +941,21 @@ def command_arguments(
     config = resolved_profile(profile, cpu_cores=cpu_cores)
     asr = profile.asr
     if command == "transcribe":
+        if isinstance(asr, FunasrMlx):
+            return [
+                "--model",
+                asr.model,
+                "--backend",
+                "mlx",
+                "--mlx-variant",
+                asr.variant,
+                "--batch-size",
+                str(profile.asr_batch_size),
+                "--job-batch-size",
+                str(profile.asr_job_batch_size),
+                "--decode-workers",
+                str(config["asr_decode_workers"]),
+            ]
         args = [
             "--model",
             asr.model,
@@ -1207,34 +1266,10 @@ def _apply_friendly_level(profile: HardwareProfile, level: str) -> HardwareProfi
     if level == "auto":
         return profile
     if level == "quality":
-        if (
-            profile.family is Family.APPLE
-            and isinstance(profile.asr, FunasrAuto)
-            and profile.asr.device == "mps"
-        ):
-            return replace(
-                profile,
-                asr=replace(profile.asr, device="cpu"),
-                notes=(
-                    f"{profile.notes} quality level keeps ASR on CPU for stability."
-                ),
-            )
+        if profile.family is Family.APPLE and isinstance(profile.asr, FunasrMlx):
+            return replace(profile, asr=FunasrAuto(ASR_NANO, "cpu"))
         return profile
     if level == "speed":
-        if (
-            profile.family is Family.APPLE
-            and isinstance(profile.asr, FunasrAuto)
-            and profile.asr.device == "cpu"
-            and isinstance(profile.match, UnifiedKey)
-            and profile.match.memory_gb >= 16
-        ):
-            return replace(
-                profile,
-                asr=replace(profile.asr, device="mps"),
-                notes=(
-                    f"{profile.notes} speed level prefers MPS when unified memory allows."
-                ),
-            )
         return profile
     raise ValueError(f"unknown friendly profile level {level!r}")
 
@@ -1291,6 +1326,84 @@ def resolve_profile_selection(
     return profile, label
 
 
+def _last_option(argv: Sequence[str], flag: str) -> tuple[bool, str | None]:
+    prefix = f"{flag}="
+    found = False
+    value: str | None = None
+    index = 0
+    values = list(argv)
+    while index < len(values):
+        token = values[index]
+        if token == flag:
+            found = True
+            if index + 1 < len(values) and not values[index + 1].startswith("--"):
+                value = values[index + 1]
+                index += 2
+                continue
+            value = None
+            index += 1
+            continue
+        if token.startswith(prefix):
+            found = True
+            value = token[len(prefix) :]
+        index += 1
+    return found, value
+
+
+def _replace_option(args: list[str], flag: str, value: str) -> list[str]:
+    prefix = f"{flag}="
+    updated: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == flag and index + 1 < len(args):
+            updated.extend((flag, value))
+            index += 2
+            continue
+        if token.startswith(prefix):
+            updated.append(f"{flag}={value}")
+            index += 1
+            continue
+        updated.append(token)
+        index += 1
+    return updated
+
+
+def _drop_option(args: list[str], flag: str) -> list[str]:
+    prefix = f"{flag}="
+    updated: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == flag:
+            index += 2 if index + 1 < len(args) else 1
+            continue
+        if token.startswith(prefix):
+            index += 1
+            continue
+        updated.append(token)
+        index += 1
+    return updated
+
+
+def _apply_mlx_benchmark_override(
+    profile: HardwareProfile,
+    profile_args: list[str],
+    user_args: Sequence[str],
+) -> list[str]:
+    if not isinstance(profile.asr, FunasrMlx):
+        return profile_args
+    device_passed, _device = _last_option(user_args, "--device")
+    backend_passed, backend = _last_option(user_args, "--backend")
+    if not device_passed and not (backend_passed and backend != "mlx"):
+        return profile_args
+    rewritten = _replace_option(profile_args, "--model", ASR_NANO)
+    rewritten = _drop_option(rewritten, "--mlx-variant")
+    if backend_passed:
+        return _drop_option(rewritten, "--backend")
+    return _replace_option(rewritten, "--backend", "auto")
+
+
 def resolve_command_argv(
     command: str,
     argv: Sequence[str],
@@ -1323,7 +1436,10 @@ def resolve_command_argv(
     )
     if announcement is not None:
         print(f"podtrans: using profile {announcement}", file=sys.stderr)
-    return command_arguments(profile, command) + rest
+    profile_args = command_arguments(profile, command)
+    if command == "transcribe":
+        profile_args = _apply_mlx_benchmark_override(profile, profile_args, rest)
+    return profile_args + rest
 
 
 def profile_json(profile: HardwareProfile, *, cpu_cores: int | None = None) -> str:

@@ -475,9 +475,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        choices=["auto", "vllm"],
+        choices=["auto", "vllm", "mlx"],
         default=None,
         help="in-process backend. Omitted means auto",
+    )
+    parser.add_argument(
+        "--mlx-variant",
+        default=None,
+        help="funasr-mlx weight variant. Required with --backend mlx",
     )
     parser.add_argument("--device", default=None, help="in-process device. Omitted means cuda")
     parser.add_argument("--language", default="auto")
