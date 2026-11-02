@@ -70,6 +70,12 @@ python -m pip install ".[inference]"
 python -m pip install ".[vllm]"
 ```
 
+The `mlx` extra is for macOS Apple Silicon. The Apple MLX path is unvalidated.
+
+```bash
+python -m pip install ".[mlx]"
+```
+
 也可以先构建 wheel，再在其他环境安装：
 
 ```bash
@@ -108,6 +114,12 @@ export PODTRANS_DATA_DIR=/path/to/podcast-data
 
 ## 硬件档位
 
+### Changelog
+
+`profiles` and `recommend` are gone. Hardware selection is flags on `transcribe`, `diarize`, `diarize-batch`, and `speaker-service`.
+
+Apple ASR above the 8GB floor targets MLX through funasr-mlx (`--backend mlx`), not PyTorch MPS. The 8GB floor stays on CPU FunASR. `quality` keeps that Apple ASR on CPU FunASR. `speed` does not select MPS. CPU FunASR and PyTorch MPS remain selectable with a trailing `--device cpu` or `--device mps` on `transcribe`. Speaker and VAD stay on CPU. Apple rows are unvalidated. Splash is out of scope for ASR. Install the extra with `pip install 'podtrans[mlx]'` on macOS. Start is still `podtrans transcribe`. The process downloads `fun-asr-nano-mlx` variant `w4a16` on first use. This path has not been run on the project machine.
+
 在功能命令上直接选择硬件，不再提供独立的 `profiles` / `recommend` 子命令。
 
 ```bash
@@ -121,12 +133,12 @@ podtrans diarize-batch --cpu-only
 
 `--profile` 接受友好档位或具体目录 id：
 
-| 值 | 含义 |
+| Value | Meaning |
 | --- | --- |
-| `auto` | 按检测到的硬件（或同时给出的硬件旗标）查询目录档位 |
-| `quality` | 同 `auto`，但 Apple 上将 ASR 留在 CPU 以提高稳定性 |
-| `speed` | 同 `auto`，但在统一内存 ≥16GB 时偏好 MPS |
-| `cpu` / `gpu-*` / `apple-m*-*gb` | 固定目录档位 |
+| `auto` | Query the catalog from the detected machine or the hardware flags. |
+| `quality` | Same Apple catalog row, with ASR on CPU FunASR. |
+| `speed` | Same catalog row as `auto`. This level does not select MPS. |
+| `cpu` / `gpu-*` / `apple-m*-*gb` | One catalog id. |
 
 `--apple-generation` 与 `--unified-gb` 必须一起给出，且不能与 `--vram-gb`、`--cpu-only` 或具体目录 `--profile` 混用。
 
@@ -134,12 +146,14 @@ podtrans diarize-batch --cpu-only
 
 Apple 档位的名称是 `apple-m{代}-{档}gb`。内置表覆盖 M1 到 M5；更新的芯片在被写进列表之前，仍然按同一张预编译表查询，例如 `apple-m6-16gb`。代际 1 和 2 共用一套批次；代际 3 及以后共用另一套。统一内存按 8、16、32、64GB 向下取整。24GB 的 M4 得到 `apple-m4-16gb`。低于 8GB 的 Apple 芯片使用该代的 8GB 档。M5 Pro 64GB 得到 `apple-m5-64gb`。
 
-所有 Apple 档位都使用 Fun-ASR-Nano。M1 和 M2 在 16GB 及以下把 ASR 放在 CPU 上，32GB 及以上使用 MPS。M3 及更新的芯片从 16GB 起使用 MPS，8GB 仍在 CPU 上。说话人模型和 VAD 留在 CPU 上。标注在当前进程完成，不启动 `speaker-service`。这些档位还没有在项目机器上跑过。
+Apple rows above 8GB use funasr-mlx. The model is `fun-asr-nano-mlx` and the variant is `w4a16`. The 8GB floor uses CPU FunASR. Speaker and VAD stay on CPU. Diarize runs in the current process. Apple rows are unvalidated.
 
 固定档位，或只改一个参数：
 
 ```bash
-podtrans transcribe --profile apple-m2-16gb --device mps
+podtrans transcribe --profile apple-m4-16gb
+podtrans transcribe --profile apple-m4-16gb --device cpu
+podtrans transcribe --profile apple-m4-16gb --device mps
 podtrans diarize --profile apple-m4-16gb --speaker-batch-size 16
 ```
 
