@@ -121,15 +121,22 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(f"unknown command {command!r}")
         if command in PROFILE_AWARE_COMMANDS:
             request, rest = extract_selection(command_args)
-            if (
-                command == "transcribe"
-                and request.profile is not None
-                and _argv_has_flag(rest, "--asr-url")
-            ):
-                raise ValueError(
-                    "--profile configures in-process FunASR; "
-                    "--asr-url does not take a hardware profile"
-                )
+            if command == "transcribe" and _argv_has_flag(rest, "--asr-url"):
+                if request.profile is not None:
+                    raise ValueError(
+                        "--profile configures in-process FunASR; "
+                        "--asr-url does not take a hardware profile"
+                    )
+                if (
+                    request.cpu_only
+                    or request.vram_gb is not None
+                    or request.apple_generation is not None
+                    or request.unified_gb is not None
+                ):
+                    raise ValueError(
+                        "--apple-generation, --unified-gb, --vram-gb, and --cpu-only "
+                        "configure in-process FunASR; --asr-url does not take hardware flags"
+                    )
             command_args = resolve_command_argv(command, command_args)
         entry = load_command(command)
         try:

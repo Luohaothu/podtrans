@@ -558,6 +558,109 @@ class CliProfileTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         load_command.assert_not_called()
 
+    def test_darwin_asr_url_skips_the_implicit_apple_profile(self) -> None:
+        captured: list[str] = []
+
+        def command(args: list[str]) -> int:
+            captured.extend(args)
+            return 0
+
+        def detect_should_not_run(*_args: object, **_kwargs: object) -> Machine:
+            raise AssertionError("detect_machine should not run for --asr-url")
+
+        stderr = io.StringIO()
+        argv = [
+            "transcribe",
+            "--asr-url",
+            "http://127.0.0.1:8000/v1",
+            "--model",
+            "whisper",
+        ]
+        with (
+            patch("podtrans.cli.load_command", return_value=command),
+            patch("podtrans.profiles.sys.platform", "darwin"),
+            patch("podtrans.profiles.detect_machine", detect_should_not_run),
+            redirect_stderr(stderr),
+        ):
+            exit_code = cli.main(argv)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured, argv[1:])
+        self.assertNotIn("--backend", captured)
+        self.assertNotIn("--device", captured)
+        self.assertNotIn("--mlx-variant", captured)
+        self.assertNotIn("using profile", stderr.getvalue())
+
+        direct = resolve_command_argv(
+            "transcribe",
+            argv[1:],
+            machine=apple(5, 64),
+            platform="darwin",
+        )
+        self.assertEqual(direct, argv[1:])
+
+    def test_darwin_hardware_flags_with_asr_url_are_rejected(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("podtrans.cli.load_command") as load_command,
+            patch("podtrans.profiles.sys.platform", "darwin"),
+            redirect_stderr(stderr),
+        ):
+            exit_code = cli.main(
+                [
+                    "transcribe",
+                    "--apple-generation",
+                    "5",
+                    "--unified-gb",
+                    "64",
+                    "--asr-url",
+                    "http://127.0.0.1:8000/v1",
+                    "--model",
+                    "whisper",
+                ]
+            )
+        self.assertEqual(exit_code, 2)
+        load_command.assert_not_called()
+        self.assertIn("--asr-url does not take hardware flags", stderr.getvalue())
+
+        with self.assertRaisesRegex(ValueError, "does not take hardware flags"):
+            resolve_command_argv(
+                "transcribe",
+                [
+                    "--cpu-only",
+                    "--asr-url",
+                    "http://127.0.0.1:8000/v1",
+                    "--model",
+                    "whisper",
+                ],
+                platform="darwin",
+            )
+
+    def test_darwin_explicit_profile_with_asr_url_is_rejected(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("podtrans.cli.load_command") as load_command,
+            patch("podtrans.profiles.sys.platform", "darwin"),
+            redirect_stderr(stderr),
+        ):
+            exit_code = cli.main(
+                [
+                    "transcribe",
+                    "--profile",
+                    "apple-m5-64gb",
+                    "--asr-url",
+                    "http://127.0.0.1:8000/v1",
+                    "--model",
+                    "whisper",
+                ]
+            )
+        self.assertEqual(exit_code, 2)
+        load_command.assert_not_called()
+        self.assertIn(
+            "--profile configures in-process FunASR; "
+            "--asr-url does not take a hardware profile",
+            stderr.getvalue(),
+        )
+
     def test_asr_url_without_profile_reaches_transcribe(self) -> None:
         captured: list[str] = []
 

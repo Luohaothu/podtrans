@@ -1421,6 +1421,18 @@ def resolve_command_argv(
         or request.apple_generation is not None
         or request.unified_gb is not None
     )
+    if command == "transcribe" and _last_option(rest, "--asr-url")[0]:
+        if request.profile is not None:
+            raise ValueError(
+                "--profile configures in-process FunASR; "
+                "--asr-url does not take a hardware profile"
+            )
+        if has_hardware:
+            raise ValueError(
+                "--apple-generation, --unified-gb, --vram-gb, and --cpu-only "
+                "configure in-process FunASR; --asr-url does not take hardware flags"
+            )
+        return args
     wants_selection = (
         request.profile is not None
         or has_hardware
