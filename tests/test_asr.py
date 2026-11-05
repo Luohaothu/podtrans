@@ -661,7 +661,7 @@ class MlxSessionTests(unittest.TestCase):
                 "--backend",
                 "mlx",
                 "--mlx-variant",
-                "w4a16",
+                "q8",
                 "--batch-size",
                 "1",
             ]
@@ -670,7 +670,7 @@ class MlxSessionTests(unittest.TestCase):
         self.assertIsInstance(spec, MlxAsr)
         assert isinstance(spec, MlxAsr)
         self.assertEqual(spec.model, "fun-asr-nano-mlx")
-        self.assertEqual(spec.variant, "w4a16")
+        self.assertEqual(spec.variant, "q8")
         self.assertEqual(spec.batch_size, 1)
         session = open_asr(spec)
         self.assertEqual(session.source.backend, "mlx")
@@ -687,7 +687,7 @@ class MlxSessionTests(unittest.TestCase):
             "--model",
             "fun-asr-nano-mlx",
             "--mlx-variant",
-            "w4a16",
+            "q8",
         ]
         rejected = (
             ["--device", "mps"],
@@ -701,7 +701,7 @@ class MlxSessionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_asr_spec(parser.parse_args([*base, *extra]))
         with self.assertRaisesRegex(ValueError, "--model"):
-            parse_asr_spec(parser.parse_args(["--backend", "mlx", "--mlx-variant", "w4a16"]))
+            parse_asr_spec(parser.parse_args(["--backend", "mlx", "--mlx-variant", "q8"]))
         with self.assertRaisesRegex(ValueError, "--mlx-variant"):
             parse_asr_spec(parser.parse_args(["--backend", "mlx", "--model", "fun-asr-nano-mlx"]))
 
@@ -710,7 +710,7 @@ class MlxSessionTests(unittest.TestCase):
             spec_args(
                 backend="mlx",
                 model="fun-asr-nano-mlx",
-                mlx_variant="w4a16",
+                mlx_variant="q8",
                 batch_size=2,
             )
         )
@@ -762,16 +762,16 @@ class MlxSessionTests(unittest.TestCase):
         self.assertEqual(len(downloads), 1)
         self.assertEqual(len(constructed), 1)
         self.assertEqual(downloads[0][0], "fun-asr-nano-mlx")
-        self.assertEqual(downloads[0][1], "w4a16")
+        self.assertEqual(downloads[0][1], "q8")
         self.assertEqual(downloads[0][2], ROOT / "models" / "funasr-mlx")
         self.assertTrue(downloads[0][2].is_absolute())
-        self.assertEqual(constructed[0], (downloads[0][2] / "w4a16", "fun-asr-nano", 96))
+        self.assertEqual(constructed[0], (downloads[0][2] / "q8", "fun-asr-nano", 512))
         self.assertNotIn("funasr_mlx", sys.modules)
 
     def test_mlx_prepare_rejects_a_checkpoint_whose_name_is_not_the_variant(self) -> None:
         session = open_asr(
             parse_asr_spec(
-                spec_args(backend="mlx", model="fun-asr-nano-mlx", mlx_variant="w4a16")
+                spec_args(backend="mlx", model="fun-asr-nano-mlx", mlx_variant="q8")
             )
         )
 
@@ -794,7 +794,7 @@ class MlxSessionTests(unittest.TestCase):
     def test_mlx_transcribe_rejects_a_worker_result_without_text(self) -> None:
         session = open_asr(
             parse_asr_spec(
-                spec_args(backend="mlx", model="fun-asr-nano-mlx", mlx_variant="w4a16")
+                spec_args(backend="mlx", model="fun-asr-nano-mlx", mlx_variant="q8")
             )
         )
 
@@ -1033,7 +1033,7 @@ class TranscribeBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--device"):
             parse_asr_spec(remote_conflict)
         variant_conflict = parser.parse_args(
-            ["--asr-url", URL, "--model", "whisper", "--mlx-variant", "w4a16"]
+            ["--asr-url", URL, "--model", "whisper", "--mlx-variant", "q8"]
         )
         with self.assertRaisesRegex(ValueError, "--mlx-variant"):
             parse_asr_spec(variant_conflict)
