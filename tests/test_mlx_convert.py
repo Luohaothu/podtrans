@@ -1,5 +1,6 @@
 import ctypes
 import errno
+import fnmatch
 import json
 import os
 import shutil
@@ -38,18 +39,28 @@ class Q8ConversionTests(unittest.TestCase):
         self.model_pt.write_bytes(b"local PyTorch weights")
         self.sidecar_fixture = self.root / "published"
         self.sidecar_fixture.mkdir()
-        for name in ("tokenizer_config.json", "vocab.json", "generation_config.json"):
+        for name in (
+            "tokenizer_config.json", "vocab.json", "generation_config.json",
+            "chat_template.json", "preprocessor_config.json",
+        ):
             (self.sidecar_fixture / name).write_text('{"published": true}')
         (self.sidecar_fixture / "merges.txt").write_text("#version: 0.2\na b\n")
         (self.sidecar_fixture / "config.json").write_text(
             json.dumps({"model_type": "fun-asr-nano", "quantization": {"bits": 4}})
         )
         (self.sidecar_fixture / "model.safetensors.index.json").write_text("{}")
-        (self.sidecar_fixture / "model.safetensors").write_bytes(b"w4a16 weights")
+        for name in ("model.safetensors", "model.npz", "pytorch_model.bin", "model.pt", "weights.pth"):
+            (self.sidecar_fixture / name).write_bytes(b"w4a16 weights")
+        (self.sidecar_fixture / "pytorch_model.bin.index.json").write_text("{}")
         (self.sidecar_fixture / "README.md").write_text("Do not copy")
         self.saved_shards = []
         self.conversions = []
+        self.fetched_files = []
         self.download = Mock(side_effect=self._download)
+        self.hf_download = Mock(side_effect=self._download)
+        self.unfiltered_download = Mock(
+            side_effect=AssertionError("Unfiltered catalog download must not run")
+        )
         self.load = Mock(return_value={
             "llm.model.layers.0.weight": FakeTensor(),
             "audio_encoder.weight": FakeTensor(),
@@ -57,7 +68,11 @@ class Q8ConversionTests(unittest.TestCase):
             "ctc.weight": FakeTensor(),
         })
         api = ModuleType("funasr_mlx.api")
-        api.download_model = self.download
+        api.download_model = self.unfiltered_download
+        modelscope_snapshot = ModuleType("modelscope.hub.snapshot_download")
+        modelscope_snapshot.snapshot_download = self.download
+        huggingface = ModuleType("huggingface_hub")
+        huggingface.snapshot_download = self.hf_download
         checkpoints = ModuleType("funasr_mlx.checkpoints")
         checkpoints.convert_checkpoint = self._convert
         self.checkpoints = checkpoints
@@ -69,6 +84,10 @@ class Q8ConversionTests(unittest.TestCase):
             "funasr_mlx": ModuleType("funasr_mlx"),
             "funasr_mlx.api": api,
             "funasr_mlx.checkpoints": checkpoints,
+            "modelscope": ModuleType("modelscope"),
+            "modelscope.hub": ModuleType("modelscope.hub"),
+            "modelscope.hub.snapshot_download": modelscope_snapshot,
+            "huggingface_hub": huggingface,
             "torch": torch,
             "safetensors": ModuleType("safetensors"),
             "safetensors.torch": safetensors_torch,
@@ -81,13 +100,19 @@ class Q8ConversionTests(unittest.TestCase):
             "TRANSFORMERS_OFFLINE": "0",
         }))
 
-    def _download(self, repo, *, variant, dest):
-        self.assertEqual(repo, "fun-asr-nano-mlx")
-        self.assertEqual(variant, "w4a16")
-        self.assertEqual(dest, self.cache)
-        target = Path(dest) / repo / variant
-        shutil.copytree(self.sidecar_fixture, target, dirs_exist_ok=True)
-        return target
+    def _download(self, model_id=None, *, repo_id=None, revision, local_dir, allow_patterns):
+        self.assertEqual(model_id or repo_id, "baicai1145/fun-asr-nano-mlx")
+        self.assertEqual(revision, "master" if model_id else "main")
+        self.assertEqual(Path(local_dir), self.cache / "fun-asr-nano-mlx")
+        for variant in ("w4a16", "fp16"):
+            for source in self.sidecar_fixture.iterdir():
+                remote_path = f"{variant}/{source.name}"
+                if any(fnmatch.fnmatchcase(remote_path, pattern) for pattern in allow_patterns):
+                    target = Path(local_dir) / remote_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+                    self.fetched_files.append(remote_path)
+        return str(local_dir)
 
     def _save_file(self, tensors, filename):
         self.saved_shards.append(dict(tensors))
@@ -132,6 +157,7 @@ class Q8ConversionTests(unittest.TestCase):
         self.assertEqual(self._ensure(), first)
         self.assertEqual(len(self.conversions), 1)
         self.download.assert_called_once()
+        self.hf_download.assert_not_called()
         self.load.assert_called_once_with(
             self.model_pt, map_location="cpu", weights_only=True, mmap=True
         )
@@ -164,6 +190,62 @@ class Q8ConversionTests(unittest.TestCase):
         saved_names = {name for shard in self.saved_shards for name in shard}
         self.assertEqual(saved_names, {"llm.model.layers.0.weight", "audio_encoder.weight"})
 
+    def test_sidecar_snapshot_filters_weights_and_preserves_every_sidecar(self):
+        checkpoint = self._ensure()
+        expected = [
+            "w4a16/config.json",
+            "w4a16/tokenizer_config.json",
+            "w4a16/vocab.json",
+            "w4a16/merges.txt",
+            "w4a16/generation_config.json",
+            "w4a16/chat_template.json",
+            "w4a16/preprocessor_config.json",
+        ]
+        patterns = self.download.call_args.kwargs["allow_patterns"]
+        self.assertEqual(patterns, expected)
+        self.assertEqual(set(self.fetched_files), set(expected))
+        source = self.cache / "fun-asr-nano-mlx" / "w4a16"
+        self.assertEqual(
+            {path.name for path in source.iterdir()},
+            {Path(name).name for name in expected},
+        )
+        for path in expected:
+            name = Path(path).name
+            if name != "config.json":
+                self.assertEqual(
+                    (checkpoint / name).read_bytes(),
+                    (self.sidecar_fixture / name).read_bytes(),
+                )
+        self.assertEqual(
+            json.loads((checkpoint / "config.json").read_text())["quantization"]["bits"], 8
+        )
+        for variant in ("w4a16", "fp16"):
+            for file in self.sidecar_fixture.iterdir():
+                remote_path = f"{variant}/{file.name}"
+                if remote_path not in expected:
+                    self.assertFalse(
+                        any(fnmatch.fnmatchcase(remote_path, pattern) for pattern in patterns)
+                    )
+        self.unfiltered_download.assert_not_called()
+        self.hf_download.assert_not_called()
+
+    def test_sidecar_fetch_falls_back_to_hugging_face_with_the_same_filter(self):
+        self.download.side_effect = OSError("ModelScope is unavailable")
+        checkpoint = self._ensure()
+        self.download.assert_called_once()
+        self.hf_download.assert_called_once()
+        primary = self.download.call_args.kwargs
+        fallback = self.hf_download.call_args.kwargs
+        self.assertEqual(primary["model_id"], fallback["repo_id"])
+        self.assertEqual(primary["revision"], "master")
+        self.assertEqual(fallback["revision"], "main")
+        self.assertEqual(primary["local_dir"], fallback["local_dir"])
+        self.assertEqual(primary["allow_patterns"], fallback["allow_patterns"])
+        self.assertTrue((checkpoint / "tokenizer_config.json").is_file())
+        self.assertTrue((checkpoint / "vocab.json").is_file())
+        self.assertTrue((checkpoint / "merges.txt").is_file())
+        self.unfiltered_download.assert_not_called()
+
     def test_source_writer_shards_without_splitting_tensors(self):
         self.load.return_value = {
             "audio_encoder.a": FakeTensor(150_000_000),
@@ -181,6 +263,7 @@ class Q8ConversionTests(unittest.TestCase):
             self.assertEqual(self._ensure(), checkpoint)
         self.assertEqual(len(self.conversions), 1)
         self.download.assert_called_once()
+        self.hf_download.assert_not_called()
 
     def test_missing_model_pt_names_required_weights_and_download_size(self):
         self.model_pt.unlink()
@@ -188,6 +271,7 @@ class Q8ConversionTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, r"q8.*Fun-ASR-Nano-2512.*2\.1 GB"):
                 self._ensure()
         self.download.assert_not_called()
+        self.hf_download.assert_not_called()
         self.load.assert_not_called()
         self.assertFalse((self.cache / "fun-asr-nano-mlx" / "q8").exists())
 
@@ -205,10 +289,12 @@ class Q8ConversionTests(unittest.TestCase):
                             candidate.unlink()
 
     def test_cached_sidecars_allow_conversion_offline(self):
-        self._download("fun-asr-nano-mlx", variant="w4a16", dest=self.cache)
+        target = self.cache / "fun-asr-nano-mlx" / "w4a16"
+        shutil.copytree(self.sidecar_fixture, target)
         with patch.dict(os.environ, {"TRANSFORMERS_OFFLINE": "1"}):
             self._ensure()
         self.download.assert_not_called()
+        self.hf_download.assert_not_called()
         self.assertEqual(len(self.conversions), 1)
 
     def test_missing_sidecars_fail_explicitly_offline(self):
@@ -216,6 +302,7 @@ class Q8ConversionTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "Offline.*w4a16 sidecars"):
                 self._ensure()
         self.download.assert_not_called()
+        self.hf_download.assert_not_called()
         self.load.assert_not_called()
 
     def test_converter_failure_leaves_no_partial_q8_or_temporary_files(self):
@@ -291,6 +378,7 @@ class Q8ConversionTests(unittest.TestCase):
             self._ensure()
         self.load.assert_not_called()
         self.download.assert_not_called()
+        self.hf_download.assert_not_called()
 
     def test_positional_only_signature_drift_is_incompatible(self):
         def incompatible(source, destination, model, dtype, source_rule, config, quantization, /):

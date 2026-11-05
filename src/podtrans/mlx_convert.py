@@ -33,6 +33,16 @@ CONVERT_DTYPE = "bfloat16"
 _SIDECAR_VARIANT = "w4a16"
 _STAMP_NAME = ".podtrans-q8-stamp.json"
 _TOKENIZER_FILES = ("tokenizer_config.json", "vocab.json", "merges.txt")
+_SIDECAR_ALLOW_PATTERNS = tuple(
+    f"{_SIDECAR_VARIANT}/{name}"
+    for name in (
+        "config.json",
+        *_TOKENIZER_FILES,
+        "generation_config.json",
+        "chat_template.json",
+        "preprocessor_config.json",
+    )
+)
 _SOURCE_SHARD_BYTES = 400_000_000
 
 
@@ -81,10 +91,8 @@ def ensure_q8_checkpoint(cache: Path, *, model_pt: Path | None = None) -> Path:
             raise FileNotFoundError(
                 f"Offline local q8 conversion needs published MLX w4a16 sidecars at {sidecars}"
             )
-        from funasr_mlx.api import download_model
-
-        print("[transcribe] downloading published MLX w4a16 tokenizer source", flush=True)
-        sidecars = Path(download_model(MLX_NANO, variant=_SIDECAR_VARIANT, dest=cache))
+        print("[transcribe] downloading published MLX w4a16 tokenizer/config sidecars", flush=True)
+        sidecars = _download_sidecars(cache)
     if not _has_sidecars(sidecars):
         raise RuntimeError(f"Published MLX tokenizer/config files are incomplete at {sidecars}")
     config = json.loads((sidecars / "config.json").read_text())
@@ -117,6 +125,29 @@ def ensure_q8_checkpoint(cache: Path, *, model_pt: Path | None = None) -> Path:
         (converted / _STAMP_NAME).write_text(json.dumps(stamp, indent=2) + "\n")
         _publish(converted, checkpoint)
     return checkpoint
+
+
+def _download_sidecars(cache: Path) -> Path:
+    repo = f"baicai1145/{MLX_NANO}"
+    destination = cache / MLX_NANO
+    options = {
+        "local_dir": str(destination),
+        "allow_patterns": list(_SIDECAR_ALLOW_PATTERNS),
+    }
+    try:
+        from modelscope.hub.snapshot_download import snapshot_download
+
+        snapshot_download(model_id=repo, revision="master", **options)
+    except Exception as exc:
+        from huggingface_hub import snapshot_download
+
+        print(
+            f"[transcribe] ModelScope sidecar fetch failed ({type(exc).__name__}); "
+            "trying Hugging Face",
+            flush=True,
+        )
+        snapshot_download(repo_id=repo, revision="main", **options)
+    return destination / _SIDECAR_VARIANT
 
 
 def _find_model_pt() -> Path | None:
