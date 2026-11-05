@@ -110,7 +110,7 @@ class FunasrVllm:
 
 
 MLX_NANO = "fun-asr-nano-mlx"
-MLX_NANO_VARIANT = "w4a16"
+MLX_NANO_VARIANT = "q8"
 
 
 @dataclass(frozen=True)
@@ -122,7 +122,7 @@ class FunasrMlx:
         if self.model != MLX_NANO:
             raise ValueError("funasr-mlx catalog model must be fun-asr-nano-mlx")
         if self.variant != MLX_NANO_VARIANT:
-            raise ValueError("funasr-mlx catalog variant must be w4a16")
+            raise ValueError("funasr-mlx local variant must be q8")
 
 
 AsrPair = FunasrAuto | FunasrVllm | FunasrMlx
@@ -293,6 +293,12 @@ class AppleRecipe:
         return generation <= self.generation_hi
 
 
+_MLX_Q8_NOTE = (
+    "Local 8-bit q8 converted from Fun-ASR-Nano model.pt. "
+    "First prepare needs the ~2.1 GB PyTorch weights and a one-time conversion. "
+)
+
+
 # Pre-compiled recipe table. Selection is a table query, not ad-hoc branching.
 APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
     AppleRecipe(
@@ -324,8 +330,8 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "funasr-mlx fun-asr-nano-mlx w4a16. "
-            "Speaker and VAD stay on CPU. Unvalidated starting point."
+            _MLX_Q8_NOTE
+            + "Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
     AppleRecipe(
@@ -340,8 +346,8 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "funasr-mlx fun-asr-nano-mlx w4a16. "
-            "Speaker stays on CPU. Unvalidated starting point."
+            _MLX_Q8_NOTE
+            + "Speaker stays on CPU. Unvalidated starting point."
         ),
     ),
     AppleRecipe(
@@ -356,8 +362,8 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "funasr-mlx fun-asr-nano-mlx w4a16, with a larger ASR batch. "
-            "Unvalidated starting point."
+            _MLX_Q8_NOTE
+            + "Larger ASR batch. Unvalidated starting point."
         ),
     ),
     AppleRecipe(
@@ -388,8 +394,8 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            "funasr-mlx fun-asr-nano-mlx w4a16, batch 1. "
-            "Speaker and VAD stay on CPU. Unvalidated starting point."
+            _MLX_Q8_NOTE
+            + "ASR batch 1. Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
     AppleRecipe(
@@ -403,7 +409,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         64,
         2,
         2,
-        "funasr-mlx fun-asr-nano-mlx w4a16, batch 2. Unvalidated starting point.",
+        _MLX_Q8_NOTE + "ASR batch 2. Unvalidated starting point.",
     ),
     AppleRecipe(
         3,
@@ -417,7 +423,8 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         2,
         4,
         (
-            "funasr-mlx fun-asr-nano-mlx w4a16, batch 4. "
+            _MLX_Q8_NOTE
+            + "ASR batch 4. "
             "Still one in-process diarize worker. "
             "Unvalidated starting point."
         ),

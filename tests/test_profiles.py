@@ -281,8 +281,10 @@ class AppleSelectionTests(unittest.TestCase):
             SpeakerService(SPEAKER_ERES2NET_V2, 32, **{"device": "mps"})
         with self.assertRaisesRegex(ValueError, "fun-asr-nano-mlx"):
             FunasrMlx(model="other")
-        with self.assertRaisesRegex(ValueError, "q8"):
-            FunasrMlx(variant="bf16")
+        for variant in ("bf16", "w4a16"):
+            with self.subTest(variant=variant):
+                with self.assertRaisesRegex(ValueError, "q8"):
+                    FunasrMlx(variant=variant)
         with self.assertRaisesRegex(ValueError, "Apple ASR"):
             replace(
                 get_profile("apple-m4-16gb"),
