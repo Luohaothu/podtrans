@@ -151,7 +151,8 @@ def _download_sidecars(cache: Path) -> Path:
 
 
 def _find_model_pt() -> Path | None:
-    roots = [Path.home() / ".cache" / "modelscope"]
+    default = Path.home() / ".cache" / "modelscope"
+    roots = [default, default / "hub"]
     if cache := os.environ.get("MODELSCOPE_CACHE"):
         roots.insert(0, Path(cache).expanduser())
     for root in roots:

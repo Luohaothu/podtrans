@@ -288,6 +288,25 @@ class Q8ConversionTests(unittest.TestCase):
                             self.assertEqual(mlx_convert._find_model_pt(), candidate)
                             candidate.unlink()
 
+    def test_source_lookup_finds_default_modelscope_hub_without_cache_env(self):
+        hub = self.root / "home" / ".cache" / "modelscope" / "hub"
+        candidate = hub / "models" / "FunAudioLLM/Fun-ASR-Nano-2512" / "model.pt"
+        candidate.parent.mkdir(parents=True)
+        candidate.write_bytes(b"weights")
+        with patch.dict(os.environ):
+            os.environ.pop("MODELSCOPE_CACHE", None)
+            self.assertEqual(mlx_convert._find_model_pt(), candidate)
+
+    def test_source_lookup_prefers_explicit_cache_over_default_hub(self):
+        default = self.root / "home" / ".cache" / "modelscope" / "hub"
+        explicit = self.root / "modelscope"
+        repo = Path("models/FunAudioLLM/Fun-ASR-Nano-2512/model.pt")
+        for root in (default, explicit):
+            candidate = root / repo
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"weights")
+        self.assertEqual(mlx_convert._find_model_pt(), explicit / repo)
+
     def test_cached_sidecars_allow_conversion_offline(self):
         target = self.cache / "fun-asr-nano-mlx" / "w4a16"
         shutil.copytree(self.sidecar_fixture, target)
