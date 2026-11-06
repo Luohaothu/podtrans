@@ -209,9 +209,9 @@ class HardwareProfile:
             if not isinstance(self.asr, FunasrAuto | FunasrVllm) or self.asr.device != "cuda":
                 raise ValueError("NVIDIA ASR must run on CUDA")
         elif isinstance(self.match, UnifiedKey):
-            cpu_auto = isinstance(self.asr, FunasrAuto) and self.asr.device == "cpu"
-            if not isinstance(self.asr, FunasrMlx) and not cpu_auto:
-                raise ValueError("Apple ASR is funasr-mlx, or FunASR auto on CPU")
+            apple_auto = isinstance(self.asr, FunasrAuto) and self.asr.device in {"cpu", "mps"}
+            if not isinstance(self.asr, FunasrMlx) and not apple_auto:
+                raise ValueError("Apple ASR is funasr-mlx, or FunASR auto on CPU or MPS")
             if not isinstance(self.speaker, InProcessSpeaker):
                 raise ValueError("Apple profiles run diarization in-process")
             if self.speaker.device != "cpu" or self.speaker.vad_device != "cpu":
@@ -261,11 +261,11 @@ def _nano(device: Literal["cpu", "cuda", "mps"]) -> FunasrAuto:
     return FunasrAuto(ASR_NANO, device)
 
 
-def _apple_floor_asr(memory_gb: int) -> FunasrAuto | FunasrMlx:
+def _apple_floor_asr(memory_gb: int) -> FunasrAuto:
     if memory_gb == 8:
         return _nano("cpu")
     if memory_gb > 8:
-        return FunasrMlx()
+        return _nano("mps")
     raise ValueError(f"Apple memory floor must be at least 8GB, got {memory_gb}")
 
 
@@ -276,7 +276,7 @@ class AppleRecipe:
     generation_lo: int
     generation_hi: int | None
     memory_gb: int
-    asr: FunasrAuto | FunasrMlx
+    asr: FunasrAuto
     asr_batch_size: int
     asr_job_batch_size: int
     asr_decode_workers: int
@@ -293,10 +293,7 @@ class AppleRecipe:
         return generation <= self.generation_hi
 
 
-_MLX_Q8_NOTE = (
-    "Local 8-bit q8 converted from Fun-ASR-Nano model.pt. "
-    "First prepare needs the ~2.1 GB PyTorch weights and a one-time conversion. "
-)
+_MPS_NOTE = "Fun-ASR-Nano on MPS with 30-second chunks. "
 
 
 # Pre-compiled recipe table. Selection is a table query, not ad-hoc branching.
@@ -330,7 +327,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            _MLX_Q8_NOTE
+            _MPS_NOTE
             + "Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
@@ -346,7 +343,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            _MLX_Q8_NOTE
+            _MPS_NOTE
             + "Speaker stays on CPU. Unvalidated starting point."
         ),
     ),
@@ -362,7 +359,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            _MLX_Q8_NOTE
+            _MPS_NOTE
             + "Larger ASR batch. Unvalidated starting point."
         ),
     ),
@@ -394,7 +391,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         1,
         2,
         (
-            _MLX_Q8_NOTE
+            _MPS_NOTE
             + "ASR batch 1. Speaker and VAD stay on CPU. Unvalidated starting point."
         ),
     ),
@@ -409,7 +406,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         64,
         2,
         2,
-        _MLX_Q8_NOTE + "ASR batch 2. Unvalidated starting point.",
+        _MPS_NOTE + "ASR batch 2. Unvalidated starting point.",
     ),
     AppleRecipe(
         3,
@@ -423,7 +420,7 @@ APPLE_RECIPE_TABLE: tuple[AppleRecipe, ...] = (
         2,
         4,
         (
-            _MLX_Q8_NOTE
+            _MPS_NOTE
             + "ASR batch 4. "
             "Still one in-process diarize worker. "
             "Unvalidated starting point."
@@ -1273,8 +1270,8 @@ def _apply_friendly_level(profile: HardwareProfile, level: str) -> HardwareProfi
     if level == "auto":
         return profile
     if level == "quality":
-        if profile.family is Family.APPLE and isinstance(profile.asr, FunasrMlx):
-            return replace(profile, asr=FunasrAuto(ASR_NANO, "cpu"))
+        if profile.family is Family.APPLE:
+            return replace(profile, asr=_nano("cpu"))
         return profile
     if level == "speed":
         return profile
@@ -1398,10 +1395,12 @@ def _apply_mlx_benchmark_override(
     profile_args: list[str],
     user_args: Sequence[str],
 ) -> list[str]:
+    backend_passed, backend = _last_option(user_args, "--backend")
+    if profile.family is Family.APPLE and backend == "mlx":
+        return command_arguments(replace(profile, asr=FunasrMlx()), "transcribe")
     if not isinstance(profile.asr, FunasrMlx):
         return profile_args
     device_passed, _device = _last_option(user_args, "--device")
-    backend_passed, backend = _last_option(user_args, "--backend")
     if not device_passed and not (backend_passed and backend != "mlx"):
         return profile_args
     rewritten = _replace_option(profile_args, "--model", ASR_NANO)

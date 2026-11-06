@@ -832,6 +832,76 @@ class MlxSessionTests(unittest.TestCase):
                     log.assert_not_called()
 
 
+class ProfileChunkDurationTests(unittest.TestCase):
+    def test_mps_keeps_30_second_chunks_and_only_mlx_uses_frontend_slack(self) -> None:
+        from podtrans.profiles import resolve_command_argv
+        from podtrans.transcribe import main as transcribe_main
+
+        cases = (([], "auto_model", "mps", 30), (["--backend", "mlx"], "mlx", "mlx", 29))
+        for overrides, backend, device, seconds in cases:
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as temp_name:
+                root = Path(temp_name)
+                audio = root / "audio"
+                audio.write_bytes(b"audio")
+                job = Job(
+                    channel="c",
+                    number="1",
+                    title="t",
+                    episode_dir=root,
+                    audio_path=audio,
+                    transcript_json=root / "transcript.json",
+                    transcript_txt=root / "transcript.txt",
+                    transcript_md=root / "transcript.md",
+                )
+                argv = resolve_command_argv(
+                    "transcribe",
+                    ["--profile", "apple-m4-16gb", *overrides, "--temp-dir", str(root / "tmp")],
+                )
+                model = "fun-asr-nano-mlx" if backend == "mlx" else DEFAULT_MODEL
+
+                class FakeSession:
+                    source = AsrSource(model=model, backend=backend, device=device)
+                    batch_size = 1
+
+                    def prepare(self) -> None:
+                        pass
+
+                    def transcribe(self, paths: list[str]) -> list[dict[str, object]]:
+                        return [{"text": "example", "timestamps": []} for _ in paths]
+
+                with (
+                    patch("podtrans.transcribe.ROOT", root),
+                    patch("podtrans.transcribe.open_asr", return_value=FakeSession()) as opened,
+                    patch("podtrans.transcribe.load_jobs", return_value=([job], [])),
+                    patch("podtrans.transcribe.find_ffmpeg", return_value="ffmpeg"),
+                    patch(
+                        "podtrans.transcribe.read_mlx_frontend_max_seconds", return_value=30,
+                    ) as frontend,
+                    patch(
+                        "podtrans.transcribe.convert_batch",
+                        return_value=({job: {"chunk_paths": ["chunk.wav"]}}, {}),
+                    ) as converted,
+                    patch("podtrans.transcribe.write_transcript") as written,
+                    patch("podtrans.transcribe.write_report"),
+                    patch("podtrans.transcribe.append_manifest"),
+                    patch("podtrans.transcribe.log"),
+                ):
+                    self.assertEqual(transcribe_main(argv), 0)
+                self.assertEqual(converted.call_args.args[-1], seconds)
+                result = written.call_args.args[1]
+                self.assertEqual(result["chunk_seconds"], seconds)
+                self.assertEqual(result["chunks"][0]["end_seconds"], seconds)
+                spec = opened.call_args.args[0]
+                if backend == "mlx":
+                    self.assertEqual(spec, MlxAsr("fun-asr-nano-mlx", "q8", 1))
+                    frontend.assert_called_once()
+                else:
+                    self.assertIsInstance(spec, AutoModelAsr)
+                    self.assertEqual(spec.model, DEFAULT_MODEL)
+                    self.assertEqual(spec.device, "mps")
+                    frontend.assert_not_called()
+
+
 class MlxChunkBoundTests(unittest.TestCase):
     def test_long_audio_chunks_stay_under_frontend_max_seconds(self) -> None:
         from podtrans.transcribe import (

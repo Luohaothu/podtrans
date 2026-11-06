@@ -114,11 +114,27 @@ export PODTRANS_DATA_DIR=/path/to/podcast-data
 
 ## 硬件档位
 
-### Changelog
+### Apple Silicon ASR
 
 `profiles` and `recommend` are gone. Hardware selection is flags on `transcribe`, `diarize`, `diarize-batch`, and `speaker-service`.
 
-Apple ASR above the 8GB floor targets MLX through funasr-mlx (`--backend mlx`), not PyTorch MPS. The 8GB floor stays on CPU FunASR. `quality` keeps that Apple ASR on CPU FunASR. `speed` does not select MPS. CPU FunASR and PyTorch MPS remain selectable with a trailing `--device cpu` or `--device mps` on `transcribe`. Speaker and VAD stay on CPU. Apple rows are unvalidated. Splash is out of scope for ASR. Install the extra with `pip install 'podtrans[mlx]'` on Apple Silicon macOS. That extra also installs FunASR and PyTorch, which the 8GB tier, `quality`, the CPU and MPS benchmarks, and in-process diarization import. Start is still `podtrans transcribe`. MLX uses a local 8-bit `q8` checkpoint and a 512-token output cap. Chunks stay at 29 seconds. A chunk that reaches the cap without EOS emits a warning and still returns its text.
+Apple Silicon catalog floors above 8GB default to FunASR auto with `FunAudioLLM/Fun-ASR-Nano-2512` on PyTorch MPS. The default chunk duration is 30 seconds. Start with either command on Apple Silicon macOS:
+
+```bash
+podtrans transcribe
+podtrans transcribe --profile auto
+```
+
+The 8GB floor stays on CPU FunASR. `quality` selects CPU FunASR for every Apple row. `speed` uses the same ASR as `auto`. To select CPU explicitly, run `podtrans transcribe --device cpu`. Speaker and VAD stay on CPU. Apple rows are unvalidated. Install the extra with `pip install 'podtrans[mlx]'` on Apple Silicon macOS. That extra includes FunASR, PyTorch, and funasr-mlx.
+
+MLX remains a manual opt-in. The first command uses the detected Apple profile. The second pins a catalog row and supplies the model and local `q8` variant explicitly:
+
+```bash
+podtrans transcribe --backend mlx
+podtrans transcribe --profile apple-m4-16gb --backend mlx --model fun-asr-nano-mlx --mlx-variant q8
+```
+
+MLX uses a local 8-bit `q8` checkpoint and a 512-token output cap. Only the MLX path caps chunks below its frontend limit, typically to 29 seconds. A chunk that reaches the output cap without EOS emits a warning and still returns its text. MLX can emit `<>` in transcripts. See the known limitation in [issue #6](https://github.com/Luohaothu/podtrans/issues/6).
 
 Before the first MLX prepare, obtain the Fun-ASR-Nano-2512 PyTorch `model.pt` weights through ModelScope, about 2.1 GB. Running the CPU or MPS path once downloads them. MLX prepare searches `$MODELSCOPE_CACHE` and `~/.cache/modelscope`, including the flattened repository snapshot layout. If `model.pt` is missing, prepare reports how to obtain it instead of starting that download.
 
@@ -143,7 +159,7 @@ podtrans diarize-batch --cpu-only
 | --- | --- |
 | `auto` | Query the catalog from the detected machine or the hardware flags. |
 | `quality` | Same Apple catalog row, with ASR on CPU FunASR. |
-| `speed` | Same catalog row as `auto`. This level does not select MPS. |
+| `speed` | Same catalog row and ASR as `auto`, including MPS above the 8GB floor. |
 | `cpu` / `gpu-*` / `apple-m*-*gb` | One catalog id. |
 
 `--apple-generation` 与 `--unified-gb` 必须一起给出，且不能与 `--vram-gb`、`--cpu-only` 或具体目录 `--profile` 混用。
@@ -152,7 +168,7 @@ podtrans diarize-batch --cpu-only
 
 Apple 档位的名称是 `apple-m{代}-{档}gb`。内置表覆盖 M1 到 M5；更新的芯片在被写进列表之前，仍然按同一张预编译表查询，例如 `apple-m6-16gb`。代际 1 和 2 共用一套批次；代际 3 及以后共用另一套。统一内存按 8、16、32、64GB 向下取整。24GB 的 M4 得到 `apple-m4-16gb`。低于 8GB 的 Apple 芯片使用该代的 8GB 档。M5 Pro 64GB 得到 `apple-m5-64gb`。
 
-Apple rows above 8GB use funasr-mlx. The model is `fun-asr-nano-mlx` and the variant is local `q8`, converted from Fun-ASR-Nano `model.pt`. The 8GB floor uses CPU FunASR. Speaker and VAD stay on CPU. Diarize runs in the current process. Apple rows are unvalidated.
+Apple rows above 8GB use FunASR auto with Fun-ASR-Nano on MPS and 30-second chunks. The 8GB floor uses CPU FunASR. MLX requires an explicit `--backend mlx` and uses local `q8`, converted from Fun-ASR-Nano `model.pt`. Speaker and VAD stay on CPU. Diarize runs in the current process. Apple rows are unvalidated.
 
 固定档位，或只改一个参数：
 

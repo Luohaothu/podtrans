@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from podtrans import cli
+from podtrans.asr import AutoModelAsr, MlxAsr, parse_asr_spec
+from podtrans.transcribe import build_parser
 from podtrans.profiles import (
     APPLE_RECIPE_TABLE,
     PROFILES,
@@ -36,14 +38,7 @@ from podtrans.profiles import (
 )
 
 NANO_MODEL = "FunAudioLLM/Fun-ASR-Nano-2512"
-MLX_PREFIX = [
-    "--model",
-    "fun-asr-nano-mlx",
-    "--backend",
-    "mlx",
-    "--mlx-variant",
-    "q8",
-]
+MPS_PREFIX = ["--model", NANO_MODEL, "--backend", "auto", "--device", "mps"]
 
 
 def flag(args: list[str], name: str) -> str:
@@ -115,36 +110,32 @@ class HardwareProfileTests(unittest.TestCase):
 class AppleSelectionTests(unittest.TestCase):
     def test_generation_and_memory_choose_the_rung(self) -> None:
         cases = (
-            (1, 8, "apple-m1-8gb", False, "1", "1"),
-            (1, 16, "apple-m1-16gb", True, "1", "1"),
-            (2, 18, "apple-m2-16gb", True, "1", "1"),
-            (2, 32, "apple-m2-32gb", True, "1", "1"),
-            (2, 64, "apple-m2-64gb", True, "2", "1"),
-            (2, 7.5, "apple-m2-8gb", False, "1", "1"),
-            (3, 8, "apple-m3-8gb", False, "1", "1"),
-            (3, 16, "apple-m3-16gb", True, "1", "1"),
-            (4, 24, "apple-m4-16gb", True, "1", "1"),
-            (4, 36, "apple-m4-32gb", True, "2", "2"),
-            (4, 48, "apple-m4-32gb", True, "2", "2"),
-            (4, 96, "apple-m4-64gb", True, "4", "2"),
-            (5, 64, "apple-m5-64gb", True, "4", "2"),
-            (6, 24, "apple-m6-16gb", True, "1", "1"),
+            (1, 8, "apple-m1-8gb", "cpu", "1", "1"),
+            (1, 16, "apple-m1-16gb", "mps", "1", "1"),
+            (2, 18, "apple-m2-16gb", "mps", "1", "1"),
+            (2, 32, "apple-m2-32gb", "mps", "1", "1"),
+            (2, 64, "apple-m2-64gb", "mps", "2", "1"),
+            (2, 7.5, "apple-m2-8gb", "cpu", "1", "1"),
+            (3, 8, "apple-m3-8gb", "cpu", "1", "1"),
+            (3, 16, "apple-m3-16gb", "mps", "1", "1"),
+            (4, 24, "apple-m4-16gb", "mps", "1", "1"),
+            (4, 36, "apple-m4-32gb", "mps", "2", "2"),
+            (4, 48, "apple-m4-32gb", "mps", "2", "2"),
+            (4, 96, "apple-m4-64gb", "mps", "4", "2"),
+            (5, 64, "apple-m5-64gb", "mps", "4", "2"),
+            (6, 24, "apple-m6-16gb", "mps", "1", "1"),
         )
-        for generation, memory, name, mlx, batch, job_batch in cases:
+        for generation, memory, name, device, batch, job_batch in cases:
             profile = select_machine(apple(generation, memory))
             args = command_arguments(profile, "transcribe", cpu_cores=16)
             self.assertEqual(profile.name, name)
             self.assertEqual(flag(args, "--batch-size"), batch)
             self.assertEqual(flag(args, "--job-batch-size"), job_batch)
             self.assertNotIn("--vllm-dtype", args)
-            if mlx:
-                self.assertEqual(args[:6], MLX_PREFIX)
-                self.assertNotIn("--device", args)
-                self.assertNotIn("mps", args)
-            else:
-                self.assertEqual(flag(args, "--model"), NANO_MODEL)
-                self.assertEqual(flag(args, "--backend"), "auto")
-                self.assertEqual(flag(args, "--device"), "cpu")
+            self.assertEqual(flag(args, "--model"), NANO_MODEL)
+            self.assertEqual(flag(args, "--backend"), "auto")
+            self.assertEqual(flag(args, "--device"), device)
+            self.assertNotIn("--mlx-variant", args)
         m4 = command_arguments(get_profile("apple-m4-16gb"), "transcribe", cpu_cores=16)
         for name in ("apple-m1-16gb", "apple-m2-16gb"):
             args = command_arguments(get_profile(name), "transcribe", cpu_cores=16)
@@ -191,14 +182,22 @@ class AppleSelectionTests(unittest.TestCase):
         for profile in apple_rows:
             transcribe = command_arguments(profile, "transcribe", cpu_cores=16)
             diarize = command_arguments(profile, "diarize", cpu_cores=16)
-            if profile.name.endswith("-8gb"):
-                self.assertEqual(flag(transcribe, "--model"), NANO_MODEL)
-                self.assertEqual(flag(transcribe, "--backend"), "auto")
-                self.assertEqual(flag(transcribe, "--device"), "cpu")
-            else:
-                self.assertEqual(transcribe[:6], MLX_PREFIX)
-                self.assertNotIn("--device", transcribe)
-                self.assertNotIn("mps", transcribe)
+            device = "cpu" if profile.name.endswith("-8gb") else "mps"
+            self.assertEqual(flag(transcribe, "--model"), NANO_MODEL)
+            self.assertEqual(flag(transcribe, "--backend"), "auto")
+            self.assertEqual(flag(transcribe, "--device"), device)
+            self.assertNotIn("--mlx-variant", transcribe)
+            config = resolved_profile(profile, cpu_cores=16)
+            self.assertEqual(config["asr_backend"], "auto")
+            self.assertEqual(config["asr_model"], NANO_MODEL)
+            self.assertEqual(config["asr_device"], device)
+            self.assertIsNone(config["asr_mlx_variant"])
+            parsed = build_parser().parse_args(transcribe)
+            spec = parse_asr_spec(parsed)
+            self.assertIsInstance(spec, AutoModelAsr)
+            self.assertEqual(spec.model, NANO_MODEL)
+            self.assertEqual(spec.device, device)
+            self.assertEqual(parsed.chunk_seconds, 30)
             self.assertNotIn("paraformer-zh", transcribe)
             self.assertEqual(flag(diarize, "--device"), "cpu")
             self.assertEqual(flag(diarize, "--vad-device"), "cpu")
@@ -211,18 +210,23 @@ class AppleSelectionTests(unittest.TestCase):
         self.assertTrue(PROFILES["gpu-48gb"].validated_on_host)
         self.assertNotIn("funasr_mlx", sys.modules)
 
-    def test_apple_recipe_table_stores_no_mps_auto_device(self) -> None:
-        saw_cpu_floor = False
+    def test_apple_recipe_table_uses_cpu_at_8gb_and_mps_above(self) -> None:
         for recipe in APPLE_RECIPE_TABLE:
-            if isinstance(recipe.asr, FunasrAuto):
-                self.assertNotEqual(recipe.asr.device, "mps")
-                self.assertEqual(recipe.asr.device, "cpu")
-                self.assertEqual(recipe.memory_gb, 8)
-                saw_cpu_floor = True
-            else:
-                self.assertIsInstance(recipe.asr, FunasrMlx)
-                self.assertGreater(recipe.memory_gb, 8)
-        self.assertTrue(saw_cpu_floor)
+            with self.subTest(generation=recipe.generation_lo, memory=recipe.memory_gb):
+                self.assertIsInstance(recipe.asr, FunasrAuto)
+                self.assertEqual(recipe.asr.model, NANO_MODEL)
+                self.assertEqual(recipe.asr.device, "cpu" if recipe.memory_gb == 8 else "mps")
+
+    def test_future_generation_keeps_default_asr_across_memory_floors(self) -> None:
+        for memory, device in ((8, "cpu"), (16, "mps"), (32, "mps"), (64, "mps")):
+            with self.subTest(memory=memory):
+                profile = query_apple_profile(6, memory)
+                parsed = build_parser().parse_args(command_arguments(profile, "transcribe"))
+                spec = parse_asr_spec(parsed)
+                self.assertIsInstance(spec, AutoModelAsr)
+                self.assertEqual(spec.model, NANO_MODEL)
+                self.assertEqual(spec.device, device)
+                self.assertEqual(parsed.chunk_seconds, 30)
 
     def test_speaker_batches_scale_with_the_rung(self) -> None:
         expectations = {
@@ -242,19 +246,18 @@ class AppleSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "apple-m4-16gb"):
             get_profile("apple-m4-24gb")
 
-    def test_apple_m4_transcribe_emits_mlx(self) -> None:
+    def test_apple_m4_transcribe_emits_mps(self) -> None:
         args = command_arguments(get_profile("apple-m4-16gb"), "transcribe", cpu_cores=8)
-        self.assertEqual(args[:6], MLX_PREFIX)
-        self.assertNotIn("--device", args)
-        self.assertNotIn("mps", args)
+        self.assertEqual(args[:6], MPS_PREFIX)
+        self.assertNotIn("--mlx-variant", args)
         config = resolved_profile(get_profile("apple-m4-16gb"), cpu_cores=8)
-        self.assertEqual(config["asr_backend"], "mlx")
-        self.assertEqual(config["asr_model"], "fun-asr-nano-mlx")
-        self.assertIsNone(config["asr_device"])
-        self.assertEqual(config["asr_mlx_variant"], "q8")
+        self.assertEqual(config["asr_backend"], "auto")
+        self.assertEqual(config["asr_model"], NANO_MODEL)
+        self.assertEqual(config["asr_device"], "mps")
+        self.assertIsNone(config["asr_mlx_variant"])
         self.assertEqual(
             get_profile("apple-m4-16gb").asr_pair_label(),
-            "mlx/fun-asr-nano-mlx@q8",
+            "auto/Fun-ASR-Nano-2512@mps",
         )
         self.assertFalse(config["validated_on_host"])
         cpu = resolved_profile(get_profile("apple-m4-8gb"), cpu_cores=8)
@@ -288,7 +291,7 @@ class AppleSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Apple ASR"):
             replace(
                 get_profile("apple-m4-16gb"),
-                asr=FunasrAuto(NANO_MODEL, "mps"),
+                asr=FunasrAuto(NANO_MODEL, "cuda"),
             )
 
     def test_in_process_profiles_use_one_worker_shard(self) -> None:
@@ -396,9 +399,9 @@ class ResolveArgvTests(unittest.TestCase):
                 machine=apple(4, 24),
                 platform="darwin",
             )
-        self.assertEqual(args[:6], MLX_PREFIX)
-        self.assertNotIn("--device", args)
-        self.assertNotIn("mps", args)
+        self.assertEqual(args[:6], MPS_PREFIX)
+        self.assertEqual(flag(args, "--device"), "mps")
+        self.assertNotIn("--mlx-variant", args)
         occurrences = [index for index, value in enumerate(args) if value == "--batch-size"]
         self.assertEqual(args[occurrences[-1] + 1], "3")
         self.assertIn("podtrans: using profile apple-m4-16gb", stderr.getvalue())
@@ -455,9 +458,9 @@ class ResolveArgvTests(unittest.TestCase):
                 ["--apple-generation", "5", "--unified-gb", "64", "--batch-size", "3"],
                 platform="linux",
             )
-        self.assertEqual(args[:6], MLX_PREFIX)
-        self.assertNotIn("--device", args)
-        self.assertNotIn("mps", args)
+        self.assertEqual(args[:6], MPS_PREFIX)
+        self.assertEqual(flag(args, "--device"), "mps")
+        self.assertNotIn("--mlx-variant", args)
         self.assertEqual(args[args.index("--batch-size", args.index("--batch-size") + 1) + 1], "3")
         self.assertIn("podtrans: using profile apple-m5-64gb", stderr.getvalue())
         self.assertNotIn("--apple-generation", args)
@@ -473,9 +476,9 @@ class ResolveArgvTests(unittest.TestCase):
                 ["--profile", "auto"],
                 platform="linux",
             )
-        self.assertEqual(args[:6], MLX_PREFIX)
-        self.assertNotIn("--device", args)
-        self.assertNotIn("mps", args)
+        self.assertEqual(args[:6], MPS_PREFIX)
+        self.assertEqual(flag(args, "--device"), "mps")
+        self.assertNotIn("--mlx-variant", args)
         self.assertIn("podtrans: using profile apple-m4-16gb", stderr.getvalue())
 
 
@@ -752,9 +755,9 @@ class CliProfileTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(exit_code, 0)
-        self.assertEqual(captured[:6], MLX_PREFIX)
-        self.assertNotIn("--device", captured)
-        self.assertNotIn("mps", captured)
+        self.assertEqual(captured[:6], MPS_PREFIX)
+        self.assertEqual(flag(captured, "--device"), "mps")
+        self.assertNotIn("--mlx-variant", captured)
         sizes = [index for index, value in enumerate(captured) if value == "--batch-size"]
         self.assertEqual(captured[sizes[-1] + 1], "3")
         self.assertIn("podtrans: using profile apple-m4-16gb", stderr.getvalue())
@@ -792,7 +795,7 @@ class CliProfileTests(unittest.TestCase):
         self.assertNotIn("fun-asr-nano-mlx", captured)
         self.assertIn("apple-m4-16gb (quality)", stderr.getvalue())
 
-    def test_profile_speed_keeps_mlx_on_early_16gb(self) -> None:
+    def test_profile_speed_uses_mps_on_early_16gb(self) -> None:
         captured: list[str] = []
 
         def command(args: list[str]) -> int:
@@ -816,9 +819,9 @@ class CliProfileTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(exit_code, 0)
-        self.assertEqual(captured[:6], MLX_PREFIX)
-        self.assertNotIn("--device", captured)
-        self.assertNotIn("mps", captured)
+        self.assertEqual(captured[:6], MPS_PREFIX)
+        self.assertEqual(flag(captured, "--device"), "mps")
+        self.assertNotIn("--mlx-variant", captured)
         self.assertIn("apple-m1-16gb (speed)", stderr.getvalue())
 
     def test_hardware_flags_reject_mixed_domains(self) -> None:
@@ -886,9 +889,9 @@ class CliProfileTests(unittest.TestCase):
         ):
             exit_code = cli.main(["transcribe", "--batch-size", "3"])
         self.assertEqual(exit_code, 0)
-        self.assertEqual(captured[:6], MLX_PREFIX)
-        self.assertNotIn("--device", captured)
-        self.assertNotIn("mps", captured)
+        self.assertEqual(captured[:6], MPS_PREFIX)
+        self.assertEqual(flag(captured, "--device"), "mps")
+        self.assertNotIn("--mlx-variant", captured)
         sizes = [index for index, value in enumerate(captured) if value == "--batch-size"]
         self.assertEqual(captured[sizes[-1] + 1], "3")
         self.assertIn("podtrans: using profile apple-m4-16gb", stderr.getvalue())
@@ -939,106 +942,136 @@ class CliProfileTests(unittest.TestCase):
 
 
 class MlxBenchmarkOverrideTests(unittest.TestCase):
-    def test_device_mps_selects_pytorch_nano(self) -> None:
-        args = resolve_command_argv(
-            "transcribe",
-            ["--profile", "apple-m4-16gb", "--device", "mps"],
-        )
-        self.assertEqual(flag(args, "--model"), NANO_MODEL)
-        self.assertEqual(flag(args, "--backend"), "auto")
-        self.assertEqual(flag(args, "--device"), "mps")
+    def test_default_mps_needs_no_device_override(self) -> None:
+        args = resolve_command_argv("transcribe", ["--profile", "apple-m4-16gb"])
+        parsed = build_parser().parse_args(args)
+        spec = parse_asr_spec(parsed)
+        self.assertIsInstance(spec, AutoModelAsr)
+        self.assertEqual(spec.model, NANO_MODEL)
+        self.assertEqual(spec.device, "mps")
+        self.assertEqual(parsed.chunk_seconds, 30)
         self.assertNotIn("--mlx-variant", args)
-        self.assertNotIn("fun-asr-nano-mlx", args)
-        self.assertEqual(flag(args, "--batch-size"), "1")
-        self.assertEqual(flag(args, "--job-batch-size"), "1")
-        self.assertGreater(args.index("--device"), args.index("--decode-workers"))
 
-    def test_device_cpu_selects_pytorch_nano(self) -> None:
+    def test_last_device_override_selects_pytorch_nano(self) -> None:
+        cases = (
+            (["--device", "mps"], "mps"),
+            (["--device", "cpu"], "cpu"),
+            (["--device=cpu"], "cpu"),
+            (["--device=cpu", "--device", "mps"], "mps"),
+            (["--device", "mps", "--device=cpu"], "cpu"),
+        )
+        for overrides, device in cases:
+            with self.subTest(overrides=overrides):
+                args = resolve_command_argv(
+                    "transcribe", ["--profile", "apple-m4-16gb", *overrides]
+                )
+                parsed = build_parser().parse_args(args)
+                spec = parse_asr_spec(parsed)
+                self.assertIsInstance(spec, AutoModelAsr)
+                self.assertEqual(spec.model, NANO_MODEL)
+                self.assertEqual(spec.device, device)
+                self.assertEqual(parsed.batch_size, 1)
+                self.assertEqual(parsed.job_batch_size, 1)
+                self.assertNotIn("--mlx-variant", args)
+
+    def test_backend_mlx_supplies_model_and_q8_without_inherited_device(self) -> None:
+        selections = (
+            ["--profile", "apple-m4-16gb"],
+            ["--profile", "apple-m4-8gb"],
+            ["--profile", "quality", "--apple-generation", "4", "--unified-gb", "24"],
+            [],
+        )
+        for selection in selections:
+            for backend in (["--backend", "mlx"], ["--backend=mlx"]):
+                with self.subTest(selection=selection, backend=backend), redirect_stderr(io.StringIO()):
+                    args = resolve_command_argv(
+                        "transcribe", [*selection, *backend],
+                        machine=apple(4, 24), platform="darwin",
+                    )
+                    parsed = build_parser().parse_args(args)
+                    self.assertEqual(parse_asr_spec(parsed), MlxAsr("fun-asr-nano-mlx", "q8", 1))
+                    self.assertIsNone(parsed.device)
+                    self.assertNotIn("--device", args)
+
+    def test_last_backend_override_wins(self) -> None:
+        cases = (
+            (["--backend", "auto", "--backend=mlx"], "mlx"),
+            (["--backend=mlx", "--backend", "auto"], "auto"),
+            (["--backend", "auto"], "auto"),
+        )
+        for overrides, backend in cases:
+            with self.subTest(overrides=overrides):
+                args = resolve_command_argv(
+                    "transcribe", ["--profile", "apple-m4-16gb", *overrides]
+                )
+                parsed = build_parser().parse_args(args)
+                spec = parse_asr_spec(parsed)
+                self.assertEqual(parsed.backend, backend)
+                if backend == "mlx":
+                    self.assertEqual(spec, MlxAsr("fun-asr-nano-mlx", "q8", 1))
+                else:
+                    self.assertIsInstance(spec, AutoModelAsr)
+                    self.assertEqual(spec.model, NANO_MODEL)
+                    self.assertEqual(spec.device, "mps")
+                    self.assertIsNone(parsed.mlx_variant)
+
+    def test_manual_mlx_preserves_explicit_model_and_variant(self) -> None:
         args = resolve_command_argv(
             "transcribe",
-            ["--profile", "apple-m4-16gb", "--device", "cpu"],
+            ["--profile", "apple-m4-16gb", "--backend=mlx",
+             "--model", "custom-model", "--mlx-variant=custom-variant", "--batch-size", "3"],
         )
-        self.assertEqual(flag(args, "--model"), NANO_MODEL)
-        self.assertEqual(flag(args, "--backend"), "auto")
-        self.assertEqual(flag(args, "--device"), "cpu")
-        self.assertNotIn("--mlx-variant", args)
-        self.assertNotIn("fun-asr-nano-mlx", args)
-
-    def test_device_equals_form_selects_pytorch_nano(self) -> None:
-        args = resolve_command_argv(
-            "transcribe",
-            ["--profile", "apple-m4-16gb", "--device=cpu"],
-        )
-        self.assertIn("--device=cpu", args)
-        self.assertEqual(flag(args, "--model"), NANO_MODEL)
-        self.assertEqual(flag(args, "--backend"), "auto")
-        self.assertNotIn("--mlx-variant", args)
-        self.assertNotIn("fun-asr-nano-mlx", args)
-
-    def test_backend_mlx_keeps_the_mlx_flags(self) -> None:
-        spaced = resolve_command_argv(
-            "transcribe",
-            ["--profile", "apple-m4-16gb", "--backend", "mlx"],
-        )
-        self.assertEqual(spaced[:6], MLX_PREFIX)
-        self.assertNotIn("--device", spaced)
-        equals = resolve_command_argv(
-            "transcribe",
-            ["--profile", "apple-m4-16gb", "--backend=mlx"],
-        )
-        self.assertEqual(equals[:6], MLX_PREFIX)
-        self.assertIn("--backend=mlx", equals)
-
-    def test_other_backend_drops_the_profile_backend(self) -> None:
-        args = resolve_command_argv(
-            "transcribe",
-            ["--profile", "apple-m4-16gb", "--backend", "auto"],
-        )
-        self.assertEqual(flag(args, "--model"), NANO_MODEL)
         self.assertEqual(
-            [args[index + 1] for index, value in enumerate(args) if value == "--backend"],
-            ["auto"],
+            parse_asr_spec(build_parser().parse_args(args)),
+            MlxAsr("custom-model", "custom-variant", 3),
         )
-        self.assertNotIn("--mlx-variant", args)
-        self.assertNotIn("fun-asr-nano-mlx", args)
+
+    def test_manual_mlx_rejects_explicit_device(self) -> None:
+        for device in (["--device", "mps"], ["--device=cpu"]):
+            with self.subTest(device=device):
+                args = resolve_command_argv(
+                    "transcribe", ["--profile", "apple-m4-16gb", "--backend", "mlx", *device]
+                )
+                with self.assertRaisesRegex(ValueError, "--device cannot be combined with --backend mlx"):
+                    parse_asr_spec(build_parser().parse_args(args))
+
+    def test_constructed_mlx_profile_retains_pytorch_device_escape(self) -> None:
+        profile = replace(get_profile("apple-m4-16gb"), asr=FunasrMlx())
+        for overrides, device in ((["--device=cpu"], "cpu"), (["--backend=auto", "--device", "mps"], "mps")):
+            with self.subTest(overrides=overrides), patch("podtrans.profiles.get_profile", return_value=profile):
+                args = resolve_command_argv(
+                    "transcribe", ["--profile", profile.name, *overrides]
+                )
+                spec = parse_asr_spec(build_parser().parse_args(args))
+                self.assertIsInstance(spec, AutoModelAsr)
+                self.assertEqual(spec.model, NANO_MODEL)
+                self.assertEqual(spec.device, device)
+                self.assertNotIn("--mlx-variant", args)
 
     def test_quality_on_the_8gb_floor_stays_cpu_funasr(self) -> None:
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             args = resolve_command_argv(
                 "transcribe",
-                [
-                    "--profile",
-                    "quality",
-                    "--apple-generation",
-                    "4",
-                    "--unified-gb",
-                    "8",
-                ],
+                ["--profile", "quality", "--apple-generation", "4", "--unified-gb", "8"],
             )
-        self.assertEqual(flag(args, "--model"), NANO_MODEL)
-        self.assertEqual(flag(args, "--backend"), "auto")
-        self.assertEqual(flag(args, "--device"), "cpu")
+        spec = parse_asr_spec(build_parser().parse_args(args))
+        self.assertIsInstance(spec, AutoModelAsr)
+        self.assertEqual(spec.model, NANO_MODEL)
+        self.assertEqual(spec.device, "cpu")
         self.assertIn("apple-m4-8gb (quality)", stderr.getvalue())
 
-    def test_speed_on_the_8gb_floor_does_not_select_mps(self) -> None:
+    def test_speed_on_the_8gb_floor_stays_cpu_funasr(self) -> None:
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             args = resolve_command_argv(
                 "transcribe",
-                [
-                    "--profile",
-                    "speed",
-                    "--apple-generation",
-                    "1",
-                    "--unified-gb",
-                    "8",
-                ],
+                ["--profile", "speed", "--apple-generation", "1", "--unified-gb", "8"],
             )
-        self.assertEqual(flag(args, "--model"), NANO_MODEL)
-        self.assertEqual(flag(args, "--backend"), "auto")
-        self.assertEqual(flag(args, "--device"), "cpu")
-        self.assertNotIn("mps", args)
+        spec = parse_asr_spec(build_parser().parse_args(args))
+        self.assertIsInstance(spec, AutoModelAsr)
+        self.assertEqual(spec.model, NANO_MODEL)
+        self.assertEqual(spec.device, "cpu")
         self.assertIn("apple-m1-8gb (speed)", stderr.getvalue())
 
 
