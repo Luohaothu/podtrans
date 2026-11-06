@@ -42,7 +42,7 @@ MLX_PREFIX = [
     "--backend",
     "mlx",
     "--mlx-variant",
-    "w4a16",
+    "q8",
 ]
 
 
@@ -251,10 +251,10 @@ class AppleSelectionTests(unittest.TestCase):
         self.assertEqual(config["asr_backend"], "mlx")
         self.assertEqual(config["asr_model"], "fun-asr-nano-mlx")
         self.assertIsNone(config["asr_device"])
-        self.assertEqual(config["asr_mlx_variant"], "w4a16")
+        self.assertEqual(config["asr_mlx_variant"], "q8")
         self.assertEqual(
             get_profile("apple-m4-16gb").asr_pair_label(),
-            "mlx/fun-asr-nano-mlx@w4a16",
+            "mlx/fun-asr-nano-mlx@q8",
         )
         self.assertFalse(config["validated_on_host"])
         cpu = resolved_profile(get_profile("apple-m4-8gb"), cpu_cores=8)
@@ -281,8 +281,10 @@ class AppleSelectionTests(unittest.TestCase):
             SpeakerService(SPEAKER_ERES2NET_V2, 32, **{"device": "mps"})
         with self.assertRaisesRegex(ValueError, "fun-asr-nano-mlx"):
             FunasrMlx(model="other")
-        with self.assertRaisesRegex(ValueError, "w4a16"):
-            FunasrMlx(variant="bf16")
+        for variant in ("bf16", "w4a16"):
+            with self.subTest(variant=variant):
+                with self.assertRaisesRegex(ValueError, "q8"):
+                    FunasrMlx(variant=variant)
         with self.assertRaisesRegex(ValueError, "Apple ASR"):
             replace(
                 get_profile("apple-m4-16gb"),

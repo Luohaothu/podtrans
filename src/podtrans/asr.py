@@ -20,6 +20,9 @@ from . import archive
 DEFAULT_MODEL = "FunAudioLLM/Fun-ASR-Nano-2512"
 _DEFAULT_DEVICE = "cuda"
 _DEFAULT_MAX_LENGTH = 256
+MLX_MAX_TOKENS = 512
+# funasr-mlx 0.2.3 llm_asr.py defines these private Qwen3 EOS ids.
+_MLX_EOS_IDS = frozenset({151643, 151645, 151671})
 _DEFAULT_BATCH_SIZE = 4
 _DEFAULT_VLLM_DTYPE = "bfloat16"
 _DEFAULT_TENSOR_PARALLEL_SIZE = 1
@@ -559,22 +562,22 @@ class _MlxAsrSession:
     def prepare(self) -> None:
         if self._worker is not None:
             return
-        from funasr_mlx.api import TranscribeWorker, download_model
+        from funasr_mlx.api import TranscribeWorker
 
+        from .mlx_convert import ensure_q8_checkpoint
+        from .profiles import FunasrMlx
+
+        FunasrMlx(model=self._spec.model, variant=self._spec.variant)
         cache = archive.ROOT / "models" / "funasr-mlx"
-        downloaded = download_model(
-            self._spec.model,
-            variant=self._spec.variant,
-            dest=cache,
-        )
-        checkpoint = Path(downloaded)
+        checkpoint = ensure_q8_checkpoint(cache)
         if checkpoint.name != self._spec.variant:
             raise ValueError(
                 f"funasr-mlx returned {checkpoint.name!r}, "
                 f"expected variant {self._spec.variant!r}"
             )
-        # The variant directory is named w4a16, so family cannot be inferred from it.
-        self._worker = TranscribeWorker(checkpoint, family="fun-asr-nano")
+        self._worker = TranscribeWorker(
+            checkpoint, family="fun-asr-nano", max_tokens=MLX_MAX_TOKENS
+        )
 
     def transcribe(self, wav_paths: Sequence[str]) -> list[dict[str, Any]]:
         paths = [str(path) for path in wav_paths]
@@ -587,6 +590,17 @@ class _MlxAsrSession:
             text = payload.get("text") if isinstance(payload, dict) else None
             if not isinstance(text, str):
                 raise RuntimeError("funasr-mlx transcription is missing text")
+            token_ids = payload.get("token_ids")
+            if (
+                isinstance(token_ids, list)
+                and len(token_ids) >= MLX_MAX_TOKENS
+                and token_ids[-1] not in _MLX_EOS_IDS
+            ):
+                print(
+                    f"[transcribe] warning: {path} reached the MLX token cap "
+                    f"of {MLX_MAX_TOKENS} without EOS; text may be truncated",
+                    flush=True,
+                )
             results.append({"text": text, "timestamps": []})
         if len(results) != len(paths):
             raise RuntimeError(
