@@ -15,9 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import archive
+
 DEFAULT_MODEL = "FunAudioLLM/Fun-ASR-Nano-2512"
 _DEFAULT_DEVICE = "cuda"
 _DEFAULT_MAX_LENGTH = 256
+MLX_MAX_TOKENS = 512
+# funasr-mlx 0.2.3 llm_asr.py defines these private Qwen3 EOS ids.
+_MLX_EOS_IDS = frozenset({151643, 151645, 151671})
 _DEFAULT_BATCH_SIZE = 4
 _DEFAULT_VLLM_DTYPE = "bfloat16"
 _DEFAULT_TENSOR_PARALLEL_SIZE = 1
@@ -49,6 +54,7 @@ SHARED_ASR_FLAGS = frozenset({
 IN_PROCESS_ASR_FLAGS = frozenset({
     "--backend",
     "--device",
+    "--mlx-variant",
     "--batch-size-s",
     "--max-length",
     "--tensor-parallel-size",
@@ -62,6 +68,7 @@ REMOTE_ASR_FLAGS = frozenset({"--asr-url"})
 _IN_PROCESS_FIELDS = (
     ("backend", "--backend"),
     ("device", "--device"),
+    ("mlx_variant", "--mlx-variant"),
     ("batch_size_s", "--batch-size-s"),
     ("max_length", "--max-length"),
     ("tensor_parallel_size", "--tensor-parallel-size"),
@@ -130,7 +137,14 @@ class RemoteAsr:
         return f"{self.base_url.rstrip('/')}/audio/transcriptions"
 
 
-AsrSpec = AutoModelAsr | VllmAsr | RemoteAsr
+@dataclass(frozen=True)
+class MlxAsr:
+    model: str
+    variant: str
+    batch_size: int
+
+
+AsrSpec = AutoModelAsr | VllmAsr | RemoteAsr | MlxAsr
 
 
 class AsrSession(Protocol):
@@ -184,13 +198,30 @@ def parse_asr_spec(args: Any) -> AsrSpec:
             batch_size=batch_size,
         )
 
+    backend = getattr(args, "backend", None) or "auto"
+    if backend == "mlx":
+        model = getattr(args, "model", None)
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("--model is required with --backend mlx")
+        variant = getattr(args, "mlx_variant", None)
+        if not isinstance(variant, str) or not variant.strip():
+            raise ValueError("--mlx-variant is required with --backend mlx")
+        for attr, flag in _IN_PROCESS_FIELDS:
+            if attr in {"backend", "mlx_variant"}:
+                continue
+            if getattr(args, attr, None) is not None:
+                raise ValueError(f"{flag} cannot be combined with --backend mlx")
+        language = getattr(args, "language", None)
+        if language not in (None, "", "auto"):
+            raise ValueError("--language must be omitted or auto with --backend mlx")
+        return MlxAsr(model=model.strip(), variant=variant.strip(), batch_size=batch_size)
+
     model = getattr(args, "model", None) or DEFAULT_MODEL
     device = getattr(args, "device", None) or _DEFAULT_DEVICE
     language = getattr(args, "language", None) or None
     max_length = getattr(args, "max_length", None)
     if max_length is None:
         max_length = _DEFAULT_MAX_LENGTH
-    backend = getattr(args, "backend", None) or "auto"
     if backend == "auto":
         return AutoModelAsr(
             model=model,
@@ -234,6 +265,8 @@ def parse_asr_spec(args: Any) -> AsrSpec:
 def open_asr(spec: AsrSpec) -> AsrSession:
     if isinstance(spec, RemoteAsr):
         return _RemoteAsrSession(spec)
+    if isinstance(spec, MlxAsr):
+        return _MlxAsrSession(spec)
     return _LocalAsrSession(spec)
 
 
@@ -512,6 +545,68 @@ class _RemoteAsrSession:
                 raise _FormatRejected(_http_error_text(exc)) from None
             raise
         return _parse_transcription_payload(_decode_json_object(raw))
+
+
+class _MlxAsrSession:
+    def __init__(self, spec: MlxAsr) -> None:
+        self.source = AsrSource(
+            model=spec.model,
+            backend="mlx",
+            device="mlx",
+            endpoint=None,
+        )
+        self.batch_size = spec.batch_size
+        self._spec = spec
+        self._worker: Any = None
+
+    def prepare(self) -> None:
+        if self._worker is not None:
+            return
+        from funasr_mlx.api import TranscribeWorker
+
+        from .mlx_convert import ensure_q8_checkpoint
+        from .profiles import FunasrMlx
+
+        FunasrMlx(model=self._spec.model, variant=self._spec.variant)
+        cache = archive.ROOT / "models" / "funasr-mlx"
+        checkpoint = ensure_q8_checkpoint(cache)
+        if checkpoint.name != self._spec.variant:
+            raise ValueError(
+                f"funasr-mlx returned {checkpoint.name!r}, "
+                f"expected variant {self._spec.variant!r}"
+            )
+        self._worker = TranscribeWorker(
+            checkpoint, family="fun-asr-nano", max_tokens=MLX_MAX_TOKENS
+        )
+
+    def transcribe(self, wav_paths: Sequence[str]) -> list[dict[str, Any]]:
+        paths = [str(path) for path in wav_paths]
+        if not paths:
+            return []
+        self.prepare()
+        results: list[dict[str, Any]] = []
+        for path in paths:
+            payload = self._worker.transcribe(path)
+            text = payload.get("text") if isinstance(payload, dict) else None
+            if not isinstance(text, str):
+                raise RuntimeError("funasr-mlx transcription is missing text")
+            token_ids = payload.get("token_ids")
+            if (
+                isinstance(token_ids, list)
+                and len(token_ids) >= MLX_MAX_TOKENS
+                and token_ids[-1] not in _MLX_EOS_IDS
+            ):
+                print(
+                    f"[transcribe] warning: {path} reached the MLX token cap "
+                    f"of {MLX_MAX_TOKENS} without EOS; text may be truncated",
+                    flush=True,
+                )
+            results.append({"text": text, "timestamps": []})
+        if len(results) != len(paths):
+            raise RuntimeError(
+                f"transcription returned {len(results)} results for {len(paths)} inputs"
+            )
+        return results
 
 
 class _LocalAsrSession:

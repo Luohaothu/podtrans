@@ -2,22 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
-import os
 import sys
 from collections.abc import Callable
 
 from . import __version__
-from .profiles import (
-    PROFILES,
-    command_arguments,
-    detect_nvidia_gpu,
-    get_profile,
-    profile_json,
-    resolved_profile,
-    select_profile,
-)
+from .profiles import extract_selection, resolve_command_argv
 
 
 Command = tuple[str, str]
@@ -60,10 +50,6 @@ Core commands:
   diarize-batch           Run concurrent diarization with one GPU model service
   speaker-service         Run or check the shared GPU embedding service
 
-Configuration:
-  profiles                List built-in hardware profiles
-  recommend               Detect hardware and recommend a profile
-
 Validation and benchmarks:
   validate-archive
   validate-diarization
@@ -71,109 +57,17 @@ Validation and benchmarks:
   benchmark-fbank
 
 Use `podtrans <command> --help` for command-specific options.
-Profile-aware commands accept `--profile NAME`; later options override it.
+Functional commands accept hardware selection flags and `--profile`:
+  --profile auto|quality|speed|<catalog-id>
+  --apple-generation N --unified-gb GB
+  --vram-gb GB | --cpu-only
+Later options override profile defaults.
+On Apple Silicon, transcribe, diarize, and speaker-service select a profile when
+`--profile` and hardware flags are omitted. Linux keeps command defaults unless
+selection flags are provided. diarize-batch always selects a profile.
+Apple and CPU profiles diarize in-process.
 """
     )
-
-
-def extract_profile(argv: list[str]) -> tuple[str | None, list[str]]:
-    profile: str | None = None
-    remaining: list[str] = []
-    index = 0
-    while index < len(argv):
-        value = argv[index]
-        if value == "--profile":
-            if index + 1 >= len(argv):
-                raise ValueError("--profile requires a value")
-            profile = argv[index + 1]
-            index += 2
-            continue
-        if value.startswith("--profile="):
-            profile = value.split("=", 1)[1]
-            index += 1
-            continue
-        remaining.append(value)
-        index += 1
-    return profile, remaining
-
-
-def profiles_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="podtrans profiles")
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--cpu-cores", type=int)
-    args = parser.parse_args(argv)
-    if args.cpu_cores is not None and args.cpu_cores <= 0:
-        parser.error("--cpu-cores must be positive")
-    if args.json:
-        import json
-
-        payload = [
-            resolved_profile(profile, cpu_cores=args.cpu_cores)
-            for profile in PROFILES.values()
-        ]
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
-    print("PROFILE    VRAM   ASR       SPK_BATCH  MAX_WORKERS  EXAMPLES")
-    for profile in PROFILES.values():
-        config = resolved_profile(profile, cpu_cores=args.cpu_cores)
-        vram = "CPU" if profile.vram_gb is None else f"{profile.vram_gb}GB"
-        examples = "; ".join(profile.examples)
-        print(
-            f"{profile.name:<10} {vram:<6} {profile.asr_backend:<9} "
-            f"{profile.speaker_batch_size:<10} "
-            f"{config['worker_shards']:<12} {examples}"
-        )
-    return 0
-
-
-def recommend_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="podtrans recommend")
-    parser.add_argument("--vram-gb", type=float)
-    parser.add_argument("--cpu-only", action="store_true")
-    parser.add_argument("--cpu-cores", type=int)
-    output = parser.add_mutually_exclusive_group()
-    output.add_argument("--json", action="store_true")
-    output.add_argument("--name-only", action="store_true")
-    args = parser.parse_args(argv)
-    if args.vram_gb is not None and args.vram_gb <= 0:
-        parser.error("--vram-gb must be positive")
-    if args.cpu_cores is not None and args.cpu_cores <= 0:
-        parser.error("--cpu-cores must be positive")
-
-    detected_name: str | None = None
-    detected_vram = args.vram_gb
-    if args.cpu_only:
-        detected_vram = None
-    elif detected_vram is None:
-        detected = detect_nvidia_gpu()
-        if detected is not None:
-            detected_name, detected_vram = detected
-
-    profile = select_profile(detected_vram)
-    if args.name_only:
-        print(profile.name)
-        return 0
-    if args.json:
-        print(profile_json(profile, cpu_cores=args.cpu_cores))
-        return 0
-
-    hardware = (
-        f"{detected_name or 'GPU'} ({detected_vram:.1f}GB)"
-        if detected_vram is not None
-        else f"CPU ({args.cpu_cores or os.cpu_count() or 1} cores)"
-    )
-    config = resolved_profile(profile, cpu_cores=args.cpu_cores)
-    print(f"hardware: {hardware}")
-    print(f"profile: {profile.name}")
-    print(f"notes: {profile.notes}")
-    print()
-    print(f"podtrans transcribe --profile {profile.name}")
-    if profile.name == "cpu":
-        print(f"podtrans diarize --profile {profile.name}")
-    else:
-        print(f"podtrans diarize-batch --profile {profile.name}")
-        print(f"recommended worker shards: {config['worker_shards']}")
-    return 0
 
 
 def _argv_has_flag(argv: list[str], flag: str) -> bool:
@@ -181,16 +75,28 @@ def _argv_has_flag(argv: list[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(prefix) for arg in argv)
 
 
+def _dependency_error(exc: ModuleNotFoundError) -> RuntimeError | None:
+    if exc.name in {"funasr_mlx", "mlx"}:
+        return RuntimeError(
+            f"missing dependency {exc.name!r}; install `podtrans[mlx]`, "
+            "the Apple Silicon extra"
+        )
+    if exc.name in INFERENCE_MODULES:
+        return RuntimeError(
+            f"missing inference dependency {exc.name!r}; install "
+            "`podtrans[inference]` or `podtrans[vllm]`"
+        )
+    return None
+
+
 def load_command(command: str) -> Callable[[list[str]], int]:
     module_name, function_name = COMMANDS[command]
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
-        if exc.name in INFERENCE_MODULES:
-            raise RuntimeError(
-                f"missing inference dependency {exc.name!r}; install "
-                "`podtrans[inference]` or `podtrans[vllm]`"
-            ) from exc
+        dependency_error = _dependency_error(exc)
+        if dependency_error is not None:
+            raise dependency_error from exc
         raise
     return getattr(module, function_name)
 
@@ -211,36 +117,34 @@ def main(argv: list[str] | None = None) -> int:
 
     command, command_args = args[0], args[1:]
     try:
-        if command == "profiles":
-            return profiles_main(command_args)
-        if command == "recommend":
-            return recommend_main(command_args)
         if command not in COMMANDS:
             raise ValueError(f"unknown command {command!r}")
-        profile_name = None
         if command in PROFILE_AWARE_COMMANDS:
-            profile_name, command_args = extract_profile(command_args)
-        if (
-            command == "transcribe"
-            and profile_name is not None
-            and _argv_has_flag(command_args, "--asr-url")
-        ):
-            raise ValueError(
-                "--profile configures in-process FunASR; "
-                "--asr-url does not take a hardware profile"
-            )
-        if profile_name is not None:
-            profile = get_profile(profile_name)
-            command_args = command_arguments(profile, command) + command_args
+            request, rest = extract_selection(command_args)
+            if command == "transcribe" and _argv_has_flag(rest, "--asr-url"):
+                if request.profile is not None:
+                    raise ValueError(
+                        "--profile configures in-process FunASR; "
+                        "--asr-url does not take a hardware profile"
+                    )
+                if (
+                    request.cpu_only
+                    or request.vram_gb is not None
+                    or request.apple_generation is not None
+                    or request.unified_gb is not None
+                ):
+                    raise ValueError(
+                        "--apple-generation, --unified-gb, --vram-gb, and --cpu-only "
+                        "configure in-process FunASR; --asr-url does not take hardware flags"
+                    )
+            command_args = resolve_command_argv(command, command_args)
         entry = load_command(command)
         try:
             return int(entry(command_args))
         except ModuleNotFoundError as exc:
-            if exc.name in INFERENCE_MODULES:
-                raise RuntimeError(
-                    f"missing inference dependency {exc.name!r}; install "
-                    "`podtrans[inference]` or `podtrans[vllm]`"
-                ) from exc
+            dependency_error = _dependency_error(exc)
+            if dependency_error is not None:
+                raise dependency_error from exc
             raise
     except (RuntimeError, ValueError) as exc:
         print(f"podtrans: error: {exc}", file=sys.stderr)

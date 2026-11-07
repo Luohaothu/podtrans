@@ -17,6 +17,7 @@ from podtrans.asr import (
     SHARED_ASR_FLAGS,
     AsrSource,
     AutoModelAsr,
+    MlxAsr,
     RemoteAsr,
     VllmAsr,
     _NoRedirectHandler,
@@ -31,6 +32,16 @@ URL = "http://127.0.0.1:8000/v1"
 TRANSCRIPTION_URL = "http://127.0.0.1:8000/v1/audio/transcriptions"
 
 
+class _MlxApiModule(ModuleType):
+    TranscribeWorker: type
+
+
+def _mlx_modules(worker: type) -> dict[str, ModuleType]:
+    api = _MlxApiModule("funasr_mlx.api")
+    api.TranscribeWorker = worker
+    return {"funasr_mlx": ModuleType("funasr_mlx"), "funasr_mlx.api": api}
+
+
 def spec_args(**overrides: object) -> SimpleNamespace:
     values: dict[str, object] = {
         "asr_url": None,
@@ -39,6 +50,7 @@ def spec_args(**overrides: object) -> SimpleNamespace:
         "batch_size": 4,
         "backend": None,
         "device": None,
+        "mlx_variant": None,
         "batch_size_s": None,
         "max_length": None,
         "tensor_parallel_size": None,
@@ -634,6 +646,311 @@ class LocalSessionTests(unittest.TestCase):
         self.assertIs(constructed[0]["enforce_eager"], False)
 
 
+class MlxSessionTests(unittest.TestCase):
+    def test_mlx_argv_builds_an_mlx_spec_without_importing_funasr_mlx(self) -> None:
+        parsed = build_parser().parse_args(
+            [
+                "--model",
+                "fun-asr-nano-mlx",
+                "--backend",
+                "mlx",
+                "--mlx-variant",
+                "q8",
+                "--batch-size",
+                "1",
+            ]
+        )
+        spec = parse_asr_spec(parsed)
+        self.assertIsInstance(spec, MlxAsr)
+        assert isinstance(spec, MlxAsr)
+        self.assertEqual(spec.model, "fun-asr-nano-mlx")
+        self.assertEqual(spec.variant, "q8")
+        self.assertEqual(spec.batch_size, 1)
+        session = open_asr(spec)
+        self.assertEqual(session.source.backend, "mlx")
+        self.assertEqual(session.source.device, "mlx")
+        self.assertIsNone(session.source.endpoint)
+        self.assertEqual(session.batch_size, 1)
+        self.assertNotIn("funasr_mlx", sys.modules)
+
+    def test_mlx_rejects_torch_and_vllm_flags(self) -> None:
+        parser = build_parser()
+        base = [
+            "--backend",
+            "mlx",
+            "--model",
+            "fun-asr-nano-mlx",
+            "--mlx-variant",
+            "q8",
+        ]
+        rejected = (
+            ["--device", "mps"],
+            ["--batch-size-s", "30"],
+            ["--max-length", "128"],
+            ["--vllm-dtype", "float16"],
+            ["--language", "zh"],
+        )
+        for extra in rejected:
+            with self.subTest(extra=extra):
+                with self.assertRaises(ValueError):
+                    parse_asr_spec(parser.parse_args([*base, *extra]))
+        with self.assertRaisesRegex(ValueError, "--model"):
+            parse_asr_spec(parser.parse_args(["--backend", "mlx", "--mlx-variant", "q8"]))
+        with self.assertRaisesRegex(ValueError, "--mlx-variant"):
+            parse_asr_spec(parser.parse_args(["--backend", "mlx", "--model", "fun-asr-nano-mlx"]))
+
+    def test_mlx_session_transcribes_each_path_from_a_stub(self) -> None:
+        spec = parse_asr_spec(
+            spec_args(
+                backend="mlx",
+                model="fun-asr-nano-mlx",
+                mlx_variant="q8",
+                batch_size=2,
+            )
+        )
+        session = open_asr(spec)
+        self.assertNotIn("funasr_mlx", sys.modules)
+        constructed: list[tuple[Path, str | None, int]] = []
+        calls: list[str] = []
+
+        class TranscribeWorker:
+            def __init__(
+                self,
+                checkpoint: Path,
+                *,
+                family: str | None = None,
+                max_tokens: int = 96,
+            ) -> None:
+                constructed.append((Path(checkpoint), family, max_tokens))
+
+            def transcribe(self, audio: str) -> dict[str, object]:
+                calls.append(str(audio))
+                return {
+                    "text": "hello",
+                    "token_ids": [1],
+                    "family": "fun-asr-nano",
+                    "wall_ms": 4,
+                }
+
+        checkpoint = ROOT / "models" / "funasr-mlx" / "fun-asr-nano-mlx" / "q8"
+        with (
+            patch.dict(sys.modules, _mlx_modules(TranscribeWorker)),
+            patch("podtrans.mlx_convert.ensure_q8_checkpoint", return_value=checkpoint) as ensure,
+        ):
+            self.assertEqual(session.transcribe([]), [])
+            ensure.assert_not_called()
+            result = session.transcribe(["a.wav", "b.wav"])
+            again = session.transcribe(["c.wav"])
+        self.assertEqual(
+            result,
+            [{"text": "hello", "timestamps": []}, {"text": "hello", "timestamps": []}],
+        )
+        self.assertEqual(again, [{"text": "hello", "timestamps": []}])
+        self.assertEqual(calls, ["a.wav", "b.wav", "c.wav"])
+        ensure.assert_called_once_with(ROOT / "models" / "funasr-mlx")
+        self.assertEqual(len(constructed), 1)
+        self.assertEqual(constructed[0], (checkpoint, "fun-asr-nano", 512))
+        self.assertNotIn("funasr_mlx", sys.modules)
+
+    def test_mlx_prepare_rejects_a_checkpoint_whose_name_is_not_the_variant(self) -> None:
+        session = open_asr(
+            parse_asr_spec(
+                spec_args(backend="mlx", model="fun-asr-nano-mlx", mlx_variant="q8")
+            )
+        )
+
+        class TranscribeWorker:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                raise AssertionError("worker should not be built")
+
+        with (
+            patch.dict(sys.modules, _mlx_modules(TranscribeWorker)),
+            patch("podtrans.mlx_convert.ensure_q8_checkpoint", return_value=ROOT / "other"),
+        ):
+            with self.assertRaises(ValueError):
+                session.prepare()
+
+    def test_mlx_transcribe_rejects_a_worker_result_without_text(self) -> None:
+        session = open_asr(
+            parse_asr_spec(
+                spec_args(backend="mlx", model="fun-asr-nano-mlx", mlx_variant="q8")
+            )
+        )
+
+        class TranscribeWorker:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def transcribe(self, _audio: str) -> dict[str, object]:
+                return {"token_ids": [1], "family": "fun-asr-nano", "wall_ms": 1}
+
+        with (
+            patch.dict(sys.modules, _mlx_modules(TranscribeWorker)),
+            patch("podtrans.mlx_convert.ensure_q8_checkpoint", return_value=ROOT / "q8"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "text"):
+                session.transcribe(["a.wav"])
+            self.assertEqual(session.transcribe([]), [])
+
+    def test_mlx_warns_at_the_token_cap_without_eos(self) -> None:
+        cases = (
+            ([1] * 512, True),
+            ([1] * 513, True),
+            ([1] * 511, False),
+            ([1] * 511 + [151643], False),
+            ([1] * 511 + [151645], False),
+            ([1] * 511 + [151671], False),
+            ([], False),
+            (None, False),
+        )
+        for token_ids, warns in cases:
+            with self.subTest(length=len(token_ids or []), last=(token_ids or [None])[-1]):
+                class TranscribeWorker:
+                    def __init__(self, *_args: object, **_kwargs: object) -> None:
+                        pass
+
+                    def transcribe(self, _audio: str) -> dict[str, object]:
+                        return {"text": "hello", "token_ids": token_ids}
+
+                session = open_asr(MlxAsr("fun-asr-nano-mlx", "q8", 1))
+                with (
+                    patch.dict(sys.modules, _mlx_modules(TranscribeWorker)),
+                    patch("podtrans.mlx_convert.ensure_q8_checkpoint", return_value=ROOT / "q8"),
+                    patch("builtins.print") as log,
+                ):
+                    self.assertEqual(
+                        session.transcribe(["chunk.wav"]),
+                        [{"text": "hello", "timestamps": []}],
+                    )
+                if warns:
+                    log.assert_called_once()
+                    self.assertIn("[transcribe] warning:", log.call_args.args[0])
+                    self.assertIn("512", log.call_args.args[0])
+                    self.assertIn("chunk.wav", log.call_args.args[0])
+                    self.assertTrue(log.call_args.kwargs["flush"])
+                else:
+                    log.assert_not_called()
+
+
+class ProfileChunkDurationTests(unittest.TestCase):
+    def test_mps_keeps_30_second_chunks_and_only_mlx_uses_frontend_slack(self) -> None:
+        from podtrans.profiles import resolve_command_argv
+        from podtrans.transcribe import main as transcribe_main
+
+        cases = (([], "auto_model", "mps", 30), (["--backend", "mlx"], "mlx", "mlx", 29))
+        for overrides, backend, device, seconds in cases:
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as temp_name:
+                root = Path(temp_name)
+                audio = root / "audio"
+                audio.write_bytes(b"audio")
+                job = Job(
+                    channel="c",
+                    number="1",
+                    title="t",
+                    episode_dir=root,
+                    audio_path=audio,
+                    transcript_json=root / "transcript.json",
+                    transcript_txt=root / "transcript.txt",
+                    transcript_md=root / "transcript.md",
+                )
+                argv = resolve_command_argv(
+                    "transcribe",
+                    ["--profile", "apple-m4-16gb", *overrides, "--temp-dir", str(root / "tmp")],
+                )
+                model = "fun-asr-nano-mlx" if backend == "mlx" else DEFAULT_MODEL
+
+                class FakeSession:
+                    source = AsrSource(model=model, backend=backend, device=device)
+                    batch_size = 1
+
+                    def prepare(self) -> None:
+                        pass
+
+                    def transcribe(self, paths: list[str]) -> list[dict[str, object]]:
+                        return [{"text": "example", "timestamps": []} for _ in paths]
+
+                with (
+                    patch("podtrans.transcribe.ROOT", root),
+                    patch("podtrans.transcribe.open_asr", return_value=FakeSession()) as opened,
+                    patch("podtrans.transcribe.load_jobs", return_value=([job], [])),
+                    patch("podtrans.transcribe.find_ffmpeg", return_value="ffmpeg"),
+                    patch(
+                        "podtrans.transcribe.read_mlx_frontend_max_seconds", return_value=30,
+                    ) as frontend,
+                    patch(
+                        "podtrans.transcribe.convert_batch",
+                        return_value=({job: {"chunk_paths": ["chunk.wav"]}}, {}),
+                    ) as converted,
+                    patch("podtrans.transcribe.write_transcript") as written,
+                    patch("podtrans.transcribe.write_report"),
+                    patch("podtrans.transcribe.append_manifest"),
+                    patch("podtrans.transcribe.log"),
+                ):
+                    self.assertEqual(transcribe_main(argv), 0)
+                self.assertEqual(converted.call_args.args[-1], seconds)
+                result = written.call_args.args[1]
+                self.assertEqual(result["chunk_seconds"], seconds)
+                self.assertEqual(result["chunks"][0]["end_seconds"], seconds)
+                spec = opened.call_args.args[0]
+                if backend == "mlx":
+                    self.assertEqual(spec, MlxAsr("fun-asr-nano-mlx", "q8", 1))
+                    frontend.assert_called_once()
+                else:
+                    self.assertIsInstance(spec, AutoModelAsr)
+                    self.assertEqual(spec.model, DEFAULT_MODEL)
+                    self.assertEqual(spec.device, "mps")
+                    frontend.assert_not_called()
+
+
+class MlxChunkBoundTests(unittest.TestCase):
+    def test_long_audio_chunks_stay_under_frontend_max_seconds(self) -> None:
+        from podtrans.transcribe import (
+            chunk_seconds_within_frontend,
+            read_mlx_frontend_max_seconds,
+        )
+
+        class FbankConfig:
+            def __init__(self) -> None:
+                self.max_seconds = 30.0
+
+        class _FunasrPackage(ModuleType):
+            __path__: list[str]
+
+        class _FrontendModule(ModuleType):
+            FbankConfig: type
+
+        package = _FunasrPackage("funasr_mlx")
+        package.__path__ = []
+        frontend = _FrontendModule("funasr_mlx.frontend")
+        frontend.FbankConfig = FbankConfig
+        with patch.dict(
+            sys.modules,
+            {"funasr_mlx": package, "funasr_mlx.frontend": frontend},
+        ):
+            max_seconds = read_mlx_frontend_max_seconds()
+        self.assertEqual(max_seconds, 30.0)
+        chosen = chunk_seconds_within_frontend(30, max_seconds)
+        self.assertLess(chosen, max_seconds)
+        self.assertEqual(chunk_seconds_within_frontend(10, max_seconds), 10)
+
+        # ffmpeg -segment_time 30 on 16 kHz PCM emitted 481280 frames (30.08 s).
+        # The frontend rejects len(samples) > int(fs * max_seconds).
+        fs = 16000
+        overhang_frames = 1280
+        sample_limit = int(fs * max_seconds)
+        total = 156
+        pieces: list[int] = []
+        remaining = total
+        while remaining > 0:
+            piece = min(chosen, remaining)
+            pieces.append(piece)
+            remaining -= piece
+        self.assertGreater(sum(pieces), max_seconds)
+        for piece in pieces:
+            frames = piece * fs + overhang_frames
+            self.assertLessEqual(frames, sample_limit)
+
+
 class RedirectAndPrepareTests(unittest.TestCase):
     def test_redirect_handler_refuses_to_follow(self) -> None:
         handler = _NoRedirectHandler()
@@ -798,6 +1115,11 @@ class TranscribeBoundaryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "--device"):
             parse_asr_spec(remote_conflict)
+        variant_conflict = parser.parse_args(
+            ["--asr-url", URL, "--model", "whisper", "--mlx-variant", "q8"]
+        )
+        with self.assertRaisesRegex(ValueError, "--mlx-variant"):
+            parse_asr_spec(variant_conflict)
 
     def test_group_failure_retries_each_wav_without_shrinking_later_groups(self) -> None:
         calls: list[list[str]] = []

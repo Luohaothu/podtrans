@@ -1,4 +1,4 @@
-"""Run concurrent diarization with one shared speaker model service.
+"""Run diarization with a shared speaker service, or in-process for CPU and Apple profiles.
 
 Pass --attach to use a speaker-service that is already running.
 """
@@ -17,13 +17,12 @@ from typing import Protocol, TextIO
 
 from . import archive
 from .profiles import (
-    PROFILES,
     HardwareProfile,
+    SelectionRequest,
     command_arguments,
-    detect_nvidia_gpu,
-    get_profile,
+    resolve_command_argv,
+    resolve_profile_selection,
     resolved_profile,
-    select_profile,
 )
 
 
@@ -301,7 +300,11 @@ def main(argv: list[str] | None = None) -> int:
         prog="podtrans diarize-batch",
         description=__doc__,
     )
-    parser.add_argument("--profile", choices=PROFILES)
+    parser.add_argument("--profile", help="auto, quality, speed, or a catalog profile id")
+    parser.add_argument("--apple-generation", type=int)
+    parser.add_argument("--unified-gb", type=float)
+    parser.add_argument("--vram-gb", type=float)
+    parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--workers", type=int)
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     parser.add_argument("--service-timeout", type=float, default=300)
@@ -323,23 +326,38 @@ def main(argv: list[str] | None = None) -> int:
     if args.service_timeout <= 0 or args.worker_start_stagger < 0:
         parser.error("timeouts must be positive and stagger must be non-negative")
 
-    if args.profile:
-        profile = get_profile(args.profile)
-    else:
-        detected = detect_nvidia_gpu()
-        profile = select_profile(detected[1] if detected else None)
+    try:
+        profile, announcement = resolve_profile_selection(
+            SelectionRequest(
+                profile=args.profile,
+                apple_generation=args.apple_generation,
+                unified_gb=args.unified_gb,
+                vram_gb=args.vram_gb,
+                cpu_only=args.cpu_only,
+            ),
+            detect=True,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if announcement is not None:
+        print(f"podtrans: using profile {announcement}", file=sys.stderr)
     config = resolved_profile(profile)
     forwarded = strip_worker_separator(args.diarize_args)
     reject_worker_socket_flag(forwarded)
 
     if args.attach:
         lease: SpeakerLease = attach_speaker_service(args.socket, args.service_timeout)
-    elif profile.name == "cpu":
+    elif not profile.uses_speaker_service:
         if args.workers not in {None, 1}:
-            parser.error("the CPU profile supports exactly one in-process worker")
+            parser.error(f"{profile.name} supports exactly one in-process worker")
         from .diarize import main as diarize_main
 
-        return diarize_main(command_arguments(profile, "diarize") + forwarded)
+        return diarize_main(
+            resolve_command_argv(
+                "diarize",
+                ["--profile", profile.name, *forwarded],
+            )
+        )
     else:
         lease = spawn_speaker_service(args.socket, profile, args.service_timeout)
 

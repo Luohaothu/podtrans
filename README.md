@@ -70,6 +70,12 @@ python -m pip install ".[inference]"
 python -m pip install ".[vllm]"
 ```
 
+The `mlx` extra is for Apple Silicon macOS. The Apple MLX path is unvalidated.
+
+```bash
+python -m pip install ".[mlx]"
+```
+
 也可以先构建 wheel，再在其他环境安装：
 
 ```bash
@@ -87,8 +93,6 @@ podtrans transcribe
 podtrans diarize
 podtrans diarize-batch
 podtrans speaker-service
-podtrans profiles
-podtrans recommend
 podtrans validate-archive
 podtrans validate-diarization
 podtrans benchmark-workers
@@ -108,27 +112,74 @@ podtrans help diarize
 export PODTRANS_DATA_DIR=/path/to/podcast-data
 ```
 
-## 硬件推荐
+## 硬件档位
 
-列出所有内置档位：
+### Apple Silicon ASR
 
-```bash
-podtrans profiles
-podtrans profiles --json
-```
+`profiles` and `recommend` are gone. Hardware selection is flags on `transcribe`, `diarize`, `diarize-batch`, and `speaker-service`.
 
-自动读取 NVIDIA GPU 名称和显存并给出配置：
+Apple Silicon catalog floors above 8GB default to FunASR auto with `FunAudioLLM/Fun-ASR-Nano-2512` on PyTorch MPS. The default chunk duration is 30 seconds. Start with either command on Apple Silicon macOS:
 
 ```bash
-podtrans recommend
+podtrans transcribe
+podtrans transcribe --profile auto
 ```
 
-没有 NVIDIA GPU 时自动选择 CPU。也可手工指定：
+The 8GB floor stays on CPU FunASR. `quality` selects CPU FunASR for every Apple row. `speed` uses the same ASR as `auto`. To select CPU explicitly, run `podtrans transcribe --device cpu`. Speaker and VAD stay on CPU. Apple rows are unvalidated. Install the extra with `pip install 'podtrans[mlx]'` on Apple Silicon macOS. That extra includes FunASR, PyTorch, and funasr-mlx.
+
+MLX remains a manual opt-in. The first command uses the detected Apple profile. The second pins a catalog row and supplies the model and local `q8` variant explicitly:
 
 ```bash
-podtrans recommend --vram-gb 16 --cpu-cores 12
-podtrans recommend --cpu-only --cpu-cores 16
+podtrans transcribe --backend mlx
+podtrans transcribe --profile apple-m4-16gb --backend mlx --model fun-asr-nano-mlx --mlx-variant q8
 ```
+
+MLX uses a local 8-bit `q8` checkpoint and a 512-token output cap. Only the MLX path caps chunks below its frontend limit, typically to 29 seconds. A chunk that reaches the output cap without EOS emits a warning and still returns its text. MLX can emit `<>` in transcripts. See the known limitation in [issue #6](https://github.com/Luohaothu/podtrans/issues/6).
+
+Before the first MLX prepare, obtain the Fun-ASR-Nano-2512 PyTorch `model.pt` weights through ModelScope, about 2.1 GB. Running the CPU or MPS path once downloads them. MLX prepare searches `$MODELSCOPE_CACHE` and `~/.cache/modelscope`, including the flattened repository snapshot layout. If `model.pt` is missing, prepare reports how to obtain it instead of starting that download.
+
+The first prepare converts `model.pt` locally and caches the result at `$PODTRANS_DATA_DIR/models/funasr-mlx/fun-asr-nano-mlx/q8/`, or `./data/models/funasr-mlx/fun-asr-nano-mlx/q8/` by default. It downloads only seven small tokenizer and config files from the published `w4a16` package, about 4.5 MB in the inspected file set. The hub requests exclude weight shards and weight indexes. Inference loads the locally converted q8 weights. This keeps the MLX special-token ids aligned with its decoder. A complete cached q8 checkpoint needs no source files or network access. To convert offline, cache both `model.pt` and the MLX sidecars first. Otherwise prepare reports the missing source files. Conversion intermediates are temporary. Existing ModelScope and Hugging Face caches remain intact.
+
+Local conversion relies on the funasr-mlx `convert_checkpoint` signature and requires `funasr-mlx>=0.2.3,<0.3`. Prepare checks that signature before conversion. Truncation detection uses the Qwen3 EOS ids `151643`, `151645`, and `151671` from funasr-mlx 0.2.3 `llm_asr.py`. Recheck both dependencies before widening the version range.
+
+在功能命令上直接选择硬件，不再提供独立的 `profiles` / `recommend` 子命令。
+
+```bash
+podtrans transcribe --apple-generation 4 --unified-gb 24
+podtrans transcribe --profile auto
+podtrans transcribe --profile quality
+podtrans transcribe --profile speed
+podtrans diarize --vram-gb 16
+podtrans diarize-batch --cpu-only
+```
+
+`--profile` 接受友好档位或具体目录 id：
+
+| Value | Meaning |
+| --- | --- |
+| `auto` | Query the catalog from the detected machine or the hardware flags. |
+| `quality` | Same Apple catalog row, with ASR on CPU FunASR. |
+| `speed` | Same catalog row and ASR as `auto`, including MPS above the 8GB floor. |
+| `cpu` / `gpu-*` / `apple-m*-*gb` | One catalog id. |
+
+`--apple-generation` 与 `--unified-gb` 必须一起给出，且不能与 `--vram-gb`、`--cpu-only` 或具体目录 `--profile` 混用。
+
+在 macOS 上，`transcribe`、`diarize` 和 `speaker-service` 在省略 `--profile` 与硬件旗标时会自动选用检测到的档位，并把名称写到标准错误，例如 `podtrans: using profile apple-m4-16gb`。写在后面的参数覆盖档位里的同名参数。Linux 上省略选择旗标时，这三个命令保持各自的默认参数；传入 `--profile auto` 或硬件旗标时才会选择。`diarize-batch` 在每个系统上都会选择一个档位。Rosetta（x86_64）进程不会被检测为 Apple 档位，而是使用 `cpu`。
+
+Apple 档位的名称是 `apple-m{代}-{档}gb`。内置表覆盖 M1 到 M5；更新的芯片在被写进列表之前，仍然按同一张预编译表查询，例如 `apple-m6-16gb`。代际 1 和 2 共用一套批次；代际 3 及以后共用另一套。统一内存按 8、16、32、64GB 向下取整。24GB 的 M4 得到 `apple-m4-16gb`。低于 8GB 的 Apple 芯片使用该代的 8GB 档。M5 Pro 64GB 得到 `apple-m5-64gb`。
+
+Apple rows above 8GB use FunASR auto with Fun-ASR-Nano on MPS and 30-second chunks. The 8GB floor uses CPU FunASR. MLX requires an explicit `--backend mlx` and uses local `q8`, converted from Fun-ASR-Nano `model.pt`. Speaker and VAD stay on CPU. Diarize runs in the current process. Apple rows are unvalidated.
+
+固定档位，或只改一个参数：
+
+```bash
+podtrans transcribe --profile apple-m4-16gb
+podtrans transcribe --profile apple-m4-16gb --device cpu
+podtrans transcribe --profile apple-m4-16gb --device mps
+podtrans diarize --profile apple-m4-16gb --speaker-batch-size 16
+```
+
+`speaker-service --profile apple-m4-16gb` 会失败，因为这个档位不使用说话人服务。
 
 推荐值是保守起点，worker 数还会按照本机 CPU 核数收缩，避免每个进程的特征提取线程造成 CPU 过量争用。
 
@@ -144,7 +195,7 @@ GPU 档位使用 `min(profile 最大 worker, CPU 核心数 // 4)`，并继续限
 
 | Profile | 典型显卡 | ASR 后端 | ASR batch | 说话人 batch | 最大 worker |
 | --- | --- | --- | ---: | ---: | ---: |
-| `cpu` | 无可用 GPU | AutoModel/CPU | 1 | 32 | 1 |
+| `cpu` | x86-64 CPU | AutoModel/CPU | 1 | 32 | 1 |
 | `gpu-4gb` | GTX 1650、RTX 3050 4GB | AutoModel | 1 | 32 | 1 |
 | `gpu-6gb` | RTX 2060、RTX 3050 6GB | AutoModel | 1 | 64 | 2 |
 | `gpu-8gb` | RTX 3060 Ti、RTX 4060、RTX 5060 | AutoModel | 2 | 128 | 2 |
@@ -158,7 +209,7 @@ GPU 档位使用 `min(profile 最大 worker, CPU 核心数 // 4)`，并继续限
 
 NVIDIA CUDA 是当前验证路径。AMD RX 7600 8GB、7700 XT 12GB、7800 XT/7900 GRE 16GB、7900 XT 20GB、7900 XTX 24GB 可按同显存档位作为参数起点，但需要兼容的 ROCm PyTorch/FunASR/vLLM 环境；无法满足运行时兼容性时应使用 `cpu`。
 
-`gpu-48gb` 来自项目实际节点验证。其他档位按显存和 CPU 供给保守缩放，应先用少量节目验证，再根据峰值显存、GPU 利用率和 CPU 特征提取速度提高参数。
+`gpu-48gb` 来自项目实际节点验证。其他 NVIDIA 档位和全部 Apple 档位按显存、统一内存和 CPU 核数保守缩放，应先用少量节目验证，再根据峰值显存、GPU 利用率和 CPU 特征提取速度提高参数。目录里只有 `gpu-48gb` 的 `validated_on_host` 为 true。
 
 ## 准备配置
 
@@ -193,12 +244,15 @@ CPU：
 podtrans transcribe --profile cpu
 ```
 
-自动推荐配置：
+按硬件旗标或友好档位选择：
 
 ```bash
-profile="$(podtrans recommend --name-only)"
-podtrans transcribe --profile "${profile}"
+podtrans transcribe --apple-generation 4 --unified-gb 24
+podtrans transcribe --profile auto
+podtrans transcribe --profile speed
 ```
+
+在 Apple Silicon 上也可以直接运行 `podtrans transcribe`。命令会套用检测到的档位，并把 `podtrans: using profile <name>` 写到标准错误。后面的参数仍然优先。Linux 上省略选择旗标时，本命令保持自己的默认值。
 
 指定 24GB 档位，并覆盖一个预设参数：
 
@@ -242,6 +296,14 @@ CPU 模式在当前进程中加载模型：
 ```bash
 podtrans diarize --profile cpu
 ```
+
+Apple Silicon 档位同样在当前进程加载说话人模型：
+
+```bash
+podtrans diarize --profile apple-m4-16gb
+```
+
+`diarize-batch` 遇到 Apple 档位或 CPU 档位时不启动 `speaker-service`，并且只允许一个 worker。
 
 GPU 高并发模式：
 
@@ -307,7 +369,6 @@ podtrans diarize-batch \
 uv lock --check
 uv sync
 uv run python -m unittest discover -s tests -v
-uv run podtrans profiles
 uv build
 ```
 
