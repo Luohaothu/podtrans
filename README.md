@@ -1,6 +1,6 @@
 # podtrans
 
-English | [简体中文](README.zh-CN.md)
+English | [简体中文](https://github.com/Luohaothu/podtrans/blob/main/README.zh-CN.md)
 
 `podtrans` is an installable CLI for archiving, transcribing, and speaker-labeling podcasts. The project uses uv to manage dependencies and the lock file. After installation, everything runs through `podtrans <command>`; you do not need to run any Python or shell scripts from the repository.
 
@@ -331,6 +331,8 @@ podtrans diarize-batch \
   --channel "Example Podcast" \
   --limit 10
 ```
+
+Replace `Example Podcast` with a podcast name exactly as it appears in `data/channels.txt`.
 
 You can also manage the shared service by hand. A single worker takes the socket directly. A batch of workers must be given `--attach` explicitly. The batch command does not switch to attach mode on its own when the socket already exists.
 

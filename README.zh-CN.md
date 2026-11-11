@@ -332,6 +332,8 @@ podtrans diarize-batch \
   --limit 10
 ```
 
+请把 `示例播客` 换成 `data/channels.txt` 中的节目名称，写法需完全一致。
+
 也可以手工管理共享服务。单个 worker 直接带上 socket。一批 worker 必须显式传入 `--attach`。socket 已经存在时，批命令不会自己改成附着模式。
 
 ```bash
