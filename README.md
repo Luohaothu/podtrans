@@ -378,6 +378,19 @@ CI 使用提交到仓库的 `uv.lock` 创建环境、运行测试、验证 CLI �
 
 仅归档你有权下载和处理的公开内容，并遵守 RSS 服务、内容平台和版权方的条款。该项目不绕过登录、付费墙、DRM 或访问控制。
 
+## 模型与许可证
+
+本仓库的代码以 [MIT](LICENSE) 许可。仓库**不包含**模型权重；运行时由用户自行下载。
+
+默认使用的模型及许可证如下（以模型卡片为准）：
+
+- `FunAudioLLM/Fun-ASR-Nano-2512`（默认 ASR）：[Apache-2.0](https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512)（Hugging Face 卡片；ModelScope 上该模型的 License 字段为空，此处以 Hugging Face 为准）。这些权重同时还受 [FunASR Model License v1.1](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE) 约束：使用、复制、修改和分享时必须注明出处和作者信息，并保留相关模型名称。
+- `baicai1145/fun-asr-nano-mlx`（MLX 路径用的 tokenizer / config sidecar）：[Apache-2.0](https://huggingface.co/baicai1145/fun-asr-nano-mlx)（Hugging Face 与 ModelScope 均为 apache-2.0；该仓库带 NOTICE）。
+- `iic/speech_eres2netv2_sv_zh-cn_16k-common`（说话人）：[Apache License 2.0](https://modelscope.cn/models/iic/speech_eres2netv2_sv_zh-cn_16k-common)（ModelScope）。
+- `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch`（VAD）：[Apache License 2.0](https://modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch)（ModelScope）。
+
+FunASR 推理库本身是 MIT。使用上述权重时请遵守对应许可证，尤其是 FunASR Model License 的署名要求。
+
 ## License
 
 [MIT](LICENSE)
